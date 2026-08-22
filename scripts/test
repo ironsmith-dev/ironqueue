@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Source rather than run, to reuse its `DATABASE_URL` and its `cd` to the repository root.
+source "${BASH_SOURCE[0]%/*}/migrate"
+
+# Reset the query-count table, which fills with dead test databases and then evicts rows the tests measure against.
+psql "$DATABASE_URL" -Atc "SELECT pg_stat_statements_reset()" >/dev/null 2>&1 || true
+
+# Forward arguments to the test harness, so a run can be narrowed, as in `scripts/test dedupe`. The `#[ignore]`d
+# stress tier is not part of this suite; run it with `scripts/stress`.
+cargo llvm-cov --locked --quiet --workspace --all-features --doctests --fail-under-lines 90 -- "$@"

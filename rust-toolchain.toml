@@ -1,0 +1,9 @@
+# https://rust-lang.github.io/rustup/overrides.html#the-toolchain-file
+[toolchain]
+# Nightly is required: `scripts/test` runs `cargo llvm-cov --doctests`, and `rustfmt.toml` sets unstable options.
+# Pinned to a date rather than floating, because `scripts/lint` denies all warnings and CI installs whatever this file
+# names: on a floating channel a new lint in that day's nightly fails the build for whoever happens to `rustup update`
+# first, and two contributors on different days compile with different rustc. Bump this deliberately.
+channel = "nightly-2026-08-13"
+profile = "minimal"
+components = ["clippy", "llvm-tools-preview", "rustfmt"]

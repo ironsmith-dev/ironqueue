@@ -1,0 +1,59 @@
+[package]
+name = "ironqueue"
+description = "Background and cron job processing backed by PostgreSQL 18+"
+autotests = false
+keywords = ["job", "queue", "cron", "postgres", "worker"]
+categories = ["asynchronous", "database"]
+readme = "../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "ironqueue"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[features]
+default = []
+# Internal: exposes the raw queue protocol to this crate's own integration
+# tests. Never enable it from application code; it bypasses the Consumer and
+# Attempt guards and carries no stability guarantee. The leading underscore
+# keeps it off the feature list docs.rs renders.
+_test = []
+
+[dependencies]
+ironqueue-macros.workspace = true
+
+anyhow.workspace = true
+axum.workspace = true
+cronexpr.workspace = true
+include_dir.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+jiff.workspace = true
+jiff-sqlx.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net"] }
+tokio-util.workspace = true
+tower.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+# Self-reference so tests (a separate crate) get the internal test-support API
+# without it leaking into normal builds.
+ironqueue = { path = ".", features = ["_test"] }
+
+tokio = { workspace = true, features = ["io-util", "net", "rt-multi-thread", "test-util"] }
+tracing-subscriber.workspace = true
+trybuild.workspace = true

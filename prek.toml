@@ -1,0 +1,72 @@
+# Configuration for `prek` (https://prek.j178.dev), run on every commit.
+# Schema: https://www.schemastore.org/prek.json
+minimum_prek_version = "0.3.11"
+
+# Hooks run cheapest first and the run stops at the first failure, so a commit
+# that is already going to be rejected never pays for a full test run.
+fail_fast = true
+
+# Vendored, minified files are not ours to reformat.
+exclude = '\.min\.(css|js)$'
+
+[[repos]]
+repo = "builtin"
+hooks = [
+    { id = "trailing-whitespace" },
+    { id = "end-of-file-fixer" },
+    { id = "mixed-line-ending", args = ["--fix=lf"] },
+    { id = "check-merge-conflict" },
+    # The logo renders ship as PNGs alongside their SVG sources, and the largest is 567 KB.
+    { id = "check-added-large-files", args = ["--maxkb=1024"] },
+    { id = "detect-private-key" },
+    { id = "check-toml" },
+    { id = "check-yaml" },
+    { id = "check-case-conflict" },
+    { id = "destroyed-symlinks" },
+]
+
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "cargo-fmt"
+name = "cargo fmt"
+entry = "cargo fmt --all -- --check"
+language = "system"
+# `rust-toolchain.toml` alongside the Rust files, because it chooses the rustfmt that formats them.
+files = '(\.rs$|^rust-toolchain\.toml$)'
+pass_filenames = false
+
+[[repos.hooks]]
+id = "lint"
+name = "cargo clippy"
+entry = "scripts/lint"
+language = "system"
+files = '^(Cargo\.(toml|lock)|rust-toolchain\.toml|ironqueue(?:-macros)?/(Cargo\.toml|sqlx\.toml|migrations/.*|.*\.rs)|scripts/lint)$'
+pass_filenames = false
+
+[[repos.hooks]]
+id = "migrate"
+name = "SQLx migrations"
+entry = "scripts/migrate"
+language = "system"
+files = '^(Cargo\.(toml|lock)|prek\.toml|compose\.yaml|ironqueue(?:-macros)?/|scripts/migrate)'
+# Dashboard files cannot change a query.
+exclude = '^ironqueue/dashboard/'
+pass_filenames = false
+
+[[repos.hooks]]
+id = "dashboard-js-test"
+name = "dashboard JavaScript tests"
+entry = "node --test ironqueue/tests/dashboard/app.test.mjs"
+language = "system"
+files = '^(ironqueue/dashboard/app\.mjs|ironqueue/tests/dashboard/app\.test\.mjs)$'
+pass_filenames = false
+
+[[repos.hooks]]
+id = "test"
+name = "cargo test"
+entry = "scripts/test"
+language = "system"
+files = '^(Cargo\.(toml|lock)|prek\.toml|compose\.yaml|rust-toolchain\.toml|ironqueue(?:-macros)?/|scripts/(migrate|publish|test))'
+pass_filenames = false

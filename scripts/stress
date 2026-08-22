@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Source rather than run, to reuse its `DATABASE_URL` and its `cd` to the repository root.
+source "${BASH_SOURCE[0]%/*}/migrate"
+
+# The `#[ignore]`d tier: sustained-load tests that assert the library's invariants under real contention and run for
+# seconds to tens of seconds each. Forward arguments so a run can be narrowed, as in `scripts/stress dedupe`.
+cargo test --locked --workspace --all-features -- --ignored "$@"

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+cd "${BASH_SOURCE[0]%/*}/.."
+
+# Enforce NNNN_migration.sql numbering so two branches cannot claim the same version.
+shopt -s nullglob
+expected=1
+for path in ironqueue/migrations/*.sql; do
+    name="$(printf '%04d_migration.sql' "$expected")"
+    if [[ ${path##*/} != "$name" ]]; then
+        echo "$path: migration must be named $name" >&2
+        exit 1
+    fi
+    expected=$((expected + 1))
+done
+
+# Lint the published build separately, since compiling tests enables a test-only feature users never get.
+cargo clippy --locked --quiet --workspace --lib -- -D warnings
+cargo clippy --locked --quiet --workspace --all-targets --all-features -- -D warnings

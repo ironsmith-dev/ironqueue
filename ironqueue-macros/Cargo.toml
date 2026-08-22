@@ -1,0 +1,20 @@
+[package]
+name = "ironqueue-macros"
+description = "Procedural macros for the ironqueue crate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "ironqueue_macros"
+proc-macro = true
+
+[dependencies]
+cronexpr.workspace = true
+proc-macro-crate.workspace = true
+proc-macro2.workspace = true
+quote.workspace = true
+syn.workspace = true

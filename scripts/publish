@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+cd "${BASH_SOURCE[0]%/*}/.."
+
+# `--check` validates the version and stops, so the release workflow can reject a bad input before running the tests.
+check_only=false
+if [[ ${1:-} == --check ]]; then
+    check_only=true
+    shift
+fi
+
+version="${1:?usage: scripts/publish [--check] <version>}"
+
+# Require a bare `x.y.z`, so neither a tag-shaped `v1.2.3` nor a pre-release suffix reaches `cargo publish`.
+if [[ ! $version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    echo "version $version is not a bare x.y.z number" >&2
+    exit 1
+fi
+
+workspace_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+if [[ $version != "$workspace_version" ]]; then
+    echo "requested version $version does not match the workspace version $workspace_version" >&2
+    exit 1
+fi
+
+if [[ $check_only == true ]]; then
+    exit 0
+fi
+
+user_agent="ironqueue release workflow (https://github.com/ironsmith-dev/ironqueue)"
+
+# Read the status code, since `curl --fail` cannot tell a network failure from a 404.
+crate_exists() {
+    local status
+    status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+        --user-agent "$user_agent" "https://crates.io/api/v1/crates/$1/$version")" || {
+        echo "crates.io could not be reached while checking $1 $version" >&2
+        exit 1
+    }
+    case "$status" in
+        200) return 0 ;;
+        404) return 1 ;;
+        *)
+            echo "crates.io answered $status while checking $1 $version" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# Publish both crates in dependency order; `publish.timeout` raises cargo's 60s index wait to 300s.
+publish_timeout=(-Z publish-timeout --config publish.timeout=300)
+if ! crate_exists ironqueue-macros; then
+    cargo publish --workspace --locked "${publish_timeout[@]}"
+elif ! crate_exists ironqueue; then
+    cargo publish --locked -p ironqueue "${publish_timeout[@]}"
+else
+    echo "both crates are already published at $version" >&2
+    exit 1
+fi
