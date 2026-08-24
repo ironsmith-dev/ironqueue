@@ -12,32 +12,94 @@ use crate::{
     wait_until, with_config,
 };
 use ironqueue::{
-    EnqueueResult, Error, JobCursor, JobFilter, JobRetention, JobRetryBackoff, JobStatus, MigrationMode, Queue,
-    WorkerCursor, WorkerFilter,
+    EnqueueResult, Error, JobCursor, JobFilter, JobRetention, JobRetryBackoff, JobStatus, Queue, WorkerCursor,
+    WorkerFilter,
 };
 use jiff::{SignedDuration, Timestamp};
 use serde_json::json;
+use sqlx::migrate::Migrate;
 use sqlx::{Connection, PgConnection, Row};
 use uuid::Uuid;
 
-async fn connect_with_validation(pool: PgPool) -> Result<Queue, Error> {
-    Queue::builder("postgres://unused").pool(pool).migration_mode(MigrationMode::Validate).connect().await
+async fn connect_queue(pool: PgPool) -> Result<Queue, Error> {
+    Queue::builder("postgres://unused").pool(pool).connect().await
+}
+
+async fn wait_for_recovery_stats(queue: &Queue, retried: u64, aborted: u64) {
+    wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+        "background recovery counters did not reach the expected values",
+        || async {
+            let stats = queue.stats();
+            stats.retried == retried && stats.aborted == aborted
+        },
+    )
+    .await;
+}
+
+async fn install_empty_migration_history(pool: &PgPool) {
+    sqlx::raw_sql(
+        "DROP SCHEMA ironqueue CASCADE;
+         CREATE SCHEMA ironqueue;
+         CREATE TABLE ironqueue.migrations (
+             version BIGINT PRIMARY KEY,
+             description TEXT NOT NULL,
+             installed_on TIMESTAMPTZ NOT NULL DEFAULT now(),
+             success BOOLEAN NOT NULL,
+             checksum BYTEA NOT NULL,
+             execution_time BIGINT NOT NULL
+         );",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn wait_for_blocked_baseline_migration(pool: &PgPool) -> i32 {
+    wait_for_some(
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+        "baseline migration did not block while creating the jobs table",
+        || async {
+            sqlx::query_scalar::<_, i32>(
+                "SELECT pid FROM pg_stat_activity
+                 WHERE datname = current_database()
+                   AND wait_event_type = 'Lock'
+                   AND query LIKE 'CREATE TABLE ironqueue.jobs%'
+                 LIMIT 1",
+            )
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+        },
+    )
+    .await
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn test_connect_is_idempotent_and_validates_migrations_again(pool: PgPool) {
+async fn test_connect_is_idempotent_and_checks_migrations_again(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    // A second connect validates the migration history as a no-op.
+    // A second connect checks the migration history without running DDL.
     let again = db.another_queue(|b| b).await;
     assert_eq!(again.name(), db.queue.name());
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn test_queue_builder_validates_migrations_by_default(pool: PgPool) {
+async fn test_queue_builder_installs_a_missing_schema(pool: PgPool) {
     sqlx::query("DROP SCHEMA ironqueue CASCADE").execute(&pool).await.unwrap();
 
-    let error = Queue::builder("postgres://unused").pool(pool).connect().await.unwrap_err();
-    assert!(matches!(&error, Error::Config(message) if message.contains("missing ironqueue migrations")), "{error}");
+    let queue = Queue::builder("postgres://unused").pool(pool).connect().await.unwrap();
+    let has_jobs = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+             SELECT 1 FROM information_schema.tables
+             WHERE table_schema = 'ironqueue' AND table_name = 'jobs'
+         )",
+    )
+    .fetch_one(queue.pool())
+    .await
+    .unwrap();
+    assert!(has_jobs);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -383,8 +445,8 @@ async fn test_migrations_use_an_isolated_history_table(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn test_failed_migration_releases_the_shared_pool_lock(pool: PgPool) {
-    let shared = crate::pool_with_max(&pool, 2).await;
+async fn test_failed_migration_check_returns_the_shared_pool_connection(pool: PgPool) {
+    let shared = crate::pool_with_max(&pool, 1).await;
     let checksum = sqlx::query_scalar::<_, Vec<u8>>("SELECT checksum FROM ironqueue.migrations WHERE version = 1")
         .fetch_one(&shared)
         .await
@@ -398,12 +460,7 @@ async fn test_failed_migration_releases_the_shared_pool_lock(pool: PgPool) {
     .await
     .unwrap();
 
-    let error = Queue::builder("postgres://unused")
-        .pool(shared.clone())
-        .migration_mode(MigrationMode::Apply)
-        .connect()
-        .await
-        .unwrap_err();
+    let error = Queue::builder("postgres://unused").pool(shared.clone()).connect().await.unwrap_err();
     assert!(matches!(error, Error::Migration(sqlx::migrate::MigrateError::VersionMismatch(1))));
 
     sqlx::query("UPDATE ironqueue.migrations SET checksum = $1 WHERE version = 1")
@@ -411,77 +468,69 @@ async fn test_failed_migration_releases_the_shared_pool_lock(pool: PgPool) {
         .execute(&shared)
         .await
         .unwrap();
-    let retry_pool =
-        PgPoolOptions::new().max_connections(1).connect_with(pool.connect_options().as_ref().clone()).await.unwrap();
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        Queue::builder("postgres://unused").pool(retry_pool).migration_mode(MigrationMode::Apply).connect(),
-    )
-    .await
-    .expect("migration lock remained held by the shared pool")
-    .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), Queue::builder("postgres://unused").pool(shared).connect())
+        .await
+        .expect("migration check did not return the shared pool connection")
+        .unwrap();
 }
 
 #[sqlx::test(migrations = "./migrations")]
 async fn test_cancelled_migration_closes_the_lock_bearing_connection(pool: PgPool) {
-    let shared = crate::pool_with_max(&pool, 2).await;
+    install_empty_migration_history(&pool).await;
+    let shared = crate::pool_with_max(&pool, 1).await;
     let mut blocker = pool.begin().await.unwrap();
-    sqlx::query("LOCK TABLE ironqueue.migrations IN ACCESS EXCLUSIVE MODE").execute(&mut *blocker).await.unwrap();
+    sqlx::query("CREATE TABLE ironqueue.jobs (id integer)").execute(&mut *blocker).await.unwrap();
 
     let applying_pool = shared.clone();
-    let applying = tokio::spawn(async move {
-        Queue::builder("postgres://unused").pool(applying_pool).migration_mode(MigrationMode::Apply).connect().await
-    });
-    wait_until(
-        Duration::from_secs(5),
-        Duration::from_millis(10),
-        "migration did not wait while holding its advisory lock",
-        || async {
-            sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS (
-                     SELECT 1 FROM pg_locks waiting
-                     WHERE waiting.relation = 'ironqueue.migrations'::regclass
-                       AND NOT waiting.granted
-                       AND EXISTS (
-                           SELECT 1 FROM pg_locks held
-                           WHERE held.pid = waiting.pid
-                             AND held.locktype = 'advisory' AND held.granted
-                       )
-                 )",
-            )
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-        },
+    let applying = tokio::spawn(async move { Queue::builder("postgres://unused").pool(applying_pool).connect().await });
+    let migration_pid = wait_for_blocked_baseline_migration(&pool).await;
+    let holds_advisory_lock = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+             SELECT 1 FROM pg_locks
+             WHERE pid = $1 AND locktype = 'advisory' AND granted
+         )",
     )
-    .await;
+    .bind(migration_pid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(holds_advisory_lock);
 
     applying.abort();
     assert!(applying.await.unwrap_err().is_cancelled());
     blocker.rollback().await.unwrap();
 
-    let retry_pool =
-        PgPoolOptions::new().max_connections(1).connect_with(pool.connect_options().as_ref().clone()).await.unwrap();
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        Queue::builder("postgres://unused").pool(retry_pool).migration_mode(MigrationMode::Apply).connect(),
+    wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+        "cancelled migration backend kept its advisory lock",
+        || async {
+            !sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)")
+                .bind(migration_pid)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        },
     )
-    .await
-    .expect("cancelled migration left its advisory lock in the shared pool")
-    .unwrap();
+    .await;
+
+    tokio::time::timeout(Duration::from_secs(2), Queue::builder("postgres://unused").pool(shared).connect())
+        .await
+        .expect("cancelled migration left the lock-bearing connection in the shared pool")
+        .unwrap();
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn test_migration_lock_timeout_is_bounded_and_restored(pool: PgPool) {
+async fn test_migration_ddl_lock_timeout_is_bounded_and_restored(pool: PgPool) {
+    install_empty_migration_history(&pool).await;
     let shared = crate::pool_with_max(&pool, 1).await;
     sqlx::query("SET lock_timeout = '7s'").execute(&shared).await.unwrap();
     let mut blocker = pool.begin().await.unwrap();
-    sqlx::query("LOCK TABLE ironqueue.migrations IN ACCESS EXCLUSIVE MODE").execute(&mut *blocker).await.unwrap();
+    sqlx::query("CREATE TABLE ironqueue.jobs (id integer)").execute(&mut *blocker).await.unwrap();
 
     let started = tokio::time::Instant::now();
     let error = Queue::builder("postgres://unused")
         .pool(shared.clone())
-        .migration_mode(MigrationMode::Apply)
         .migration_lock_timeout(Duration::from_millis(50))
         .connect()
         .await
@@ -492,7 +541,43 @@ async fn test_migration_lock_timeout_is_bounded_and_restored(pool: PgPool) {
     let restored =
         sqlx::query_scalar::<_, String>("SELECT current_setting('lock_timeout')").fetch_one(&shared).await.unwrap();
     assert_eq!(restored, "7s");
+    let held_advisory_locks = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM pg_locks
+         WHERE locktype = 'advisory' AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(held_advisory_locks, 0);
     blocker.rollback().await.unwrap();
+
+    Queue::builder("postgres://unused").pool(shared).connect().await.unwrap();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn test_migration_advisory_lock_timeout_is_bounded_and_restored(pool: PgPool) {
+    let deleted = sqlx::query("DELETE FROM ironqueue.migrations").execute(&pool).await.unwrap();
+    assert_eq!(deleted.rows_affected(), 1);
+
+    let mut blocker = pool.acquire().await.unwrap();
+    Migrate::lock(&mut *blocker).await.unwrap();
+    let shared = crate::pool_with_max(&pool, 1).await;
+    sqlx::query("SET lock_timeout = '7s'").execute(&shared).await.unwrap();
+
+    let started = tokio::time::Instant::now();
+    let error = Queue::builder("postgres://unused")
+        .pool(shared.clone())
+        .migration_lock_timeout(Duration::from_millis(50))
+        .connect()
+        .await
+        .unwrap_err();
+    assert!(matches!(&error, Error::Migration(_)), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(2), "migration ignored its advisory lock timeout");
+
+    let restored =
+        sqlx::query_scalar::<_, String>("SELECT current_setting('lock_timeout')").fetch_one(&shared).await.unwrap();
+    assert_eq!(restored, "7s");
+    Migrate::unlock(&mut *blocker).await.unwrap();
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -503,7 +588,6 @@ async fn test_migration_lock_timeout_rejects_unrepresentable_values(pool: PgPool
     ] {
         let error = Queue::builder("postgres://unused")
             .pool(pool.clone())
-            .migration_mode(MigrationMode::Apply)
             .migration_lock_timeout(timeout)
             .connect()
             .await
@@ -514,7 +598,7 @@ async fn test_migration_lock_timeout_rejects_unrepresentable_values(pool: PgPool
 
 //noinspection SqlNoDataSourceInspection
 #[sqlx::test(migrations = "./migrations")]
-async fn test_migration_mode_validate_needs_no_schema_ddl_privilege(pool: PgPool) {
+async fn test_current_schema_needs_no_schema_ddl_privilege(pool: PgPool) {
     let restricted = crate::pool_with_max(&pool, 1).await;
     sqlx::query("SET ROLE pg_read_all_data").execute(&restricted).await.unwrap();
     let can_create =
@@ -524,27 +608,77 @@ async fn test_migration_mode_validate_needs_no_schema_ddl_privilege(pool: PgPool
             .unwrap();
     assert!(!can_create);
 
-    let queue = Queue::builder("postgres://unused")
-        .pool(restricted)
-        .migration_mode(MigrationMode::Validate)
-        .connect()
-        .await
-        .unwrap();
+    let queue = Queue::builder("postgres://unused").pool(restricted).connect().await.unwrap();
+    assert_eq!(queue.name(), "default");
+}
+
+//noinspection SqlNoDataSourceInspection
+#[sqlx::test(migrations = "./migrations")]
+async fn test_restricted_connection_rechecks_history_after_waiting_for_migration_lock(pool: PgPool) {
+    let mut privileged = pool.acquire().await.unwrap();
+    Migrate::lock(&mut *privileged).await.unwrap();
+    let saved = sqlx::query_as::<_, (i64, String, bool, Vec<u8>, i64)>(
+        "DELETE FROM ironqueue.migrations
+         RETURNING version, description, success, checksum, execution_time",
+    )
+    .fetch_one(&mut *privileged)
+    .await
+    .unwrap();
+
+    let restricted = crate::pool_with_max(&pool, 1).await;
+    sqlx::query("SET ROLE pg_read_all_data").execute(&restricted).await.unwrap();
+    let applying_pool = restricted.clone();
+    let applying = tokio::spawn(async move { Queue::builder("postgres://unused").pool(applying_pool).connect().await });
+    wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+        "restricted connection did not wait for the migration lock",
+        || async {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_locks
+                     WHERE locktype = 'advisory' AND NOT granted
+                       AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+                 )",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        },
+    )
+    .await;
+
+    sqlx::query(
+        "INSERT INTO ironqueue.migrations
+             (version, description, success, checksum, execution_time)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(saved.0)
+    .bind(saved.1)
+    .bind(saved.2)
+    .bind(saved.3)
+    .bind(saved.4)
+    .execute(&mut *privileged)
+    .await
+    .unwrap();
+    Migrate::unlock(&mut *privileged).await.unwrap();
+
+    let queue = applying.await.unwrap().unwrap();
     assert_eq!(queue.name(), "default");
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn test_migration_mode_validate_rejects_a_dirty_migration(pool: PgPool) {
+async fn test_connect_rejects_a_dirty_migration(pool: PgPool) {
     let changed =
         sqlx::query("UPDATE ironqueue.migrations SET success = false WHERE version = 1").execute(&pool).await.unwrap();
     assert_eq!(changed.rows_affected(), 1);
 
-    let error = connect_with_validation(pool).await.unwrap_err();
+    let error = connect_queue(pool.clone()).await.unwrap_err();
     assert!(matches!(error, Error::Migration(sqlx::migrate::MigrateError::Dirty(1))), "{error}");
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn test_migration_mode_validate_rejects_an_unknown_migration(pool: PgPool) {
+async fn test_connect_rejects_an_unknown_migration(pool: PgPool) {
     let inserted = sqlx::query(
         "INSERT INTO ironqueue.migrations
              (version, description, success, checksum, execution_time)
@@ -556,12 +690,12 @@ async fn test_migration_mode_validate_rejects_an_unknown_migration(pool: PgPool)
     .unwrap();
     assert_eq!(inserted.rows_affected(), 1);
 
-    let error = connect_with_validation(pool).await.unwrap_err();
+    let error = connect_queue(pool).await.unwrap_err();
     assert!(matches!(error, Error::Migration(sqlx::migrate::MigrateError::VersionMissing(999999))), "{error}");
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn test_migration_mode_validate_rejects_a_modified_migration(pool: PgPool) {
+async fn test_connect_rejects_a_modified_migration(pool: PgPool) {
     let changed = sqlx::query(
         "UPDATE ironqueue.migrations SET checksum = checksum || decode('00', 'hex')
          WHERE version = 1",
@@ -571,12 +705,12 @@ async fn test_migration_mode_validate_rejects_a_modified_migration(pool: PgPool)
     .unwrap();
     assert_eq!(changed.rows_affected(), 1);
 
-    let error = connect_with_validation(pool).await.unwrap_err();
+    let error = connect_queue(pool).await.unwrap_err();
     assert!(matches!(error, Error::Migration(sqlx::migrate::MigrateError::VersionMismatch(1))), "{error}");
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn test_migration_mode_validate_rejects_a_missing_migration(pool: PgPool) {
+async fn test_connect_releases_the_migration_lock_after_applying_a_missing_history_entry_fails(pool: PgPool) {
     let deleted = sqlx::query(
         "DELETE FROM ironqueue.migrations
          WHERE version = (SELECT max(version) FROM ironqueue.migrations)",
@@ -586,31 +720,18 @@ async fn test_migration_mode_validate_rejects_a_missing_migration(pool: PgPool) 
     .unwrap();
     assert_eq!(deleted.rows_affected(), 1);
 
-    let error = connect_with_validation(pool).await.unwrap_err();
-    assert!(
-        matches!(error, Error::Config(ref message) if message.starts_with("database is missing ironqueue migration")),
-        "{error}"
-    );
-}
+    let error = connect_queue(pool.clone()).await.unwrap_err();
+    assert!(matches!(error, Error::Migration(_)), "{error}");
 
-#[sqlx::test(migrations = "./migrations")]
-async fn test_migration_mode_skip_does_not_require_the_queue_schema(pool: PgPool) {
-    sqlx::query("DROP SCHEMA ironqueue CASCADE").execute(&pool).await.unwrap();
-
-    Queue::builder("postgres://unused").pool(pool).migration_mode(MigrationMode::Skip).connect().await.unwrap();
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn test_migration_mode_validate_rejects_a_missing_migration_history(pool: PgPool) {
-    sqlx::query("DROP SCHEMA ironqueue CASCADE").execute(&pool).await.unwrap();
-
-    let error = Queue::builder("postgres://unused")
-        .pool(pool)
-        .migration_mode(MigrationMode::Validate)
-        .connect()
-        .await
-        .unwrap_err();
-    assert!(matches!(error, Error::Config(ref message) if message.contains("missing ironqueue migrations")), "{error}");
+    //noinspection SpellCheckingInspection
+    let held_migration_locks = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM pg_locks
+         WHERE locktype = 'advisory' AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(held_migration_locks, 0);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -1830,6 +1951,7 @@ async fn test_dropping_an_unsettled_consumer_attempt_recovers_the_job(pool: PgPo
     // `aborted`, not `failed`: nothing here ever saw a handler report an error.
     assert_eq!(row.status, JobStatus::Aborted);
     assert_eq!(row.error.as_deref(), Some("attempt dropped without settlement"));
+    wait_for_recovery_stats(&db.queue, 0, 1).await;
 
     // Two attempts allowed: the drop spends the first and hands the row back.
     let retryable = db
@@ -1856,6 +1978,7 @@ async fn test_dropping_an_unsettled_consumer_attempt_recovers_the_job(pool: PgPo
     assert_eq!(row.max_attempts, 2);
     assert_eq!(row.worker_id, None);
     assert_eq!(row.error.as_deref(), Some("attempt dropped without settlement"));
+    wait_for_recovery_stats(&db.queue, 1, 1).await;
 
     // Drain the row the branch above handed back, for the reason the branch
     // order itself exists: it is `queued` again and sorts ahead of the job
@@ -1894,6 +2017,7 @@ async fn test_dropping_an_unsettled_consumer_attempt_recovers_the_job(pool: PgPo
         },
     )
     .await;
+    wait_for_recovery_stats(&db.queue, 1, 2).await;
 }
 
 /// And the recovery's guards make it a no-op once the row has moved on, so a
@@ -1915,6 +2039,9 @@ async fn test_dropping_a_settled_consumer_attempt_leaves_the_row_alone(pool: PgP
     assert_eq!(row.status, JobStatus::Complete);
     assert_eq!(row.result, Some(json!("done")));
     assert_eq!(row.attempts, 1);
+    assert_eq!(db.queue.stats().complete, 1);
+    assert_eq!(db.queue.stats().retried, 0);
+    assert_eq!(db.queue.stats().aborted, 0);
 }
 
 #[sqlx::test(migrations = "./migrations")]

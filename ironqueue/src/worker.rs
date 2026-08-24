@@ -3329,6 +3329,10 @@ async fn schedule_crons_once(
 
 /// Runs the sweeper on its timer; leadership is advisory-lock coordinated.
 async fn sweep_loop(inner: Arc<WorkerInner>, token: CancellationToken) {
+    run_sweep_loop_with_drain_time(inner, token, MAX_SWEEP_DRAIN_TIME).await;
+}
+
+async fn run_sweep_loop_with_drain_time(inner: Arc<WorkerInner>, token: CancellationToken, max_drain_time: Duration) {
     let mut sweeper = inner.database.sweeper();
     let mut interval = tokio::time::interval(inner.timers.sweep);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3341,7 +3345,7 @@ async fn sweep_loop(inner: Arc<WorkerInner>, token: CancellationToken) {
             }
             _ = interval.tick() => {}
         }
-        let drain_until = tokio::time::Instant::now() + inner.timers.sweep.min(MAX_SWEEP_DRAIN_TIME);
+        let drain_until = tokio::time::Instant::now() + inner.timers.sweep.min(max_drain_time);
         // The sweeper shares the worker's pool with dequeues and finalization,
         // so a drain is bounded by passes as well as wall clock, and each pass
         // repeats only the operations that filled their batch.
@@ -3422,6 +3426,11 @@ async fn sweep_loop(inner: Arc<WorkerInner>, token: CancellationToken) {
             }
         }
     }
+}
+
+#[cfg(feature = "_test")]
+pub(crate) async fn run_sweep_loop_for_test(worker: Worker, token: CancellationToken, max_drain_time: Duration) {
+    run_sweep_loop_with_drain_time(worker.inner, token, max_drain_time).await;
 }
 
 /// Heartbeats this worker's stats row for `Queue::workers_page` and the dashboard.

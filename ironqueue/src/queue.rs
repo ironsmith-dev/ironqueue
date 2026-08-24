@@ -50,93 +50,6 @@ pub struct QueueCounts {
     pub aborted: i64,
 }
 
-/// How queue connections handle the embedded `ironqueue` migrations.
-///
-/// Migrations are one-way, and that constrains how releases are rolled out.
-/// Each version is applied at most once and there is no down migration, so a
-/// database is only ever moved forward. Every mode but [`MigrationMode::Skip`]
-/// validates what is already applied against what this binary embeds, and
-/// rejects a version the binary does not know.
-///
-/// That check reads `ironqueue.migrations` and nothing else, so it
-/// detects version skew and a tampered history — not a schema whose objects
-/// were dropped. A database whose history table survives its tables connects
-/// cleanly under [`MigrationMode::Apply`] as much as [`MigrationMode::Validate`],
-/// and fails on first use with an `Error::Db` naming the missing relation — so an *older* binary that
-/// restarts against a database a newer one has migrated fails
-/// [`QueueBuilder::connect`] with `MigrateError::VersionMissing`, under
-/// [`MigrationMode::Apply`] as much as under [`MigrationMode::Validate`].
-/// Deploy new code first and roll forward; a rollback needs the old binary
-/// pointed at a database that was never migrated past it.
-///
-/// Schema changes are written so that the release that applies them can run
-/// alongside the one before it — the pods still on the old release keep working
-/// while the new one migrates.
-///
-/// # Privileges
-///
-/// The mode decides what the connecting role must be granted, and
-/// [`MigrationMode::Apply`] is not the cheap end of that: it runs the migrator
-/// on *every* connect, and the migrator issues `CREATE SCHEMA IF NOT EXISTS`
-/// and `CREATE TABLE IF NOT EXISTS` before it looks at what is already applied.
-/// PostgreSQL checks the privilege before `IF NOT EXISTS` can bail out, so an
-/// already-migrated database still refuses a role without `CREATE`. `Apply`
-/// therefore needs DDL rights permanently, not just for the first migration, and
-/// it takes an exclusive per-database advisory lock on every connect — which
-/// serializes a fleet's startup and blocks indefinitely, with no timeout, behind
-/// anything else holding it (a pod wedged mid-migration, or an operator's
-/// `sqlx migrate run`).
-///
-/// A least-privilege deployment therefore migrates *once* — a release step, or
-/// `sqlx migrate run` — and runs with [`MigrationMode::Validate`], which takes
-/// no lock and needs no DDL rights. The grants each mode needs:
-///
-/// - [`MigrationMode::Validate`] — `CONNECT` on the database; `USAGE` on schema
-///   `ironqueue`; `SELECT` on `ironqueue.migrations`; `SELECT, INSERT,
-///   UPDATE, DELETE` on `jobs`, `workers`, `cron_schedules` and
-///   `cron_occurrences`; and `EXECUTE` on `ironqueue.job_is_stuck`,
-///   `ironqueue.job_page_keys` and `ironqueue.job_page_keys_by_name`.
-/// - [`MigrationMode::Skip`] — the same, minus `SELECT` on
-///   `ironqueue.migrations`.
-/// - [`MigrationMode::Apply`] — everything above, plus `CREATE` on the database
-///   *and* on schema `ironqueue` on every connect, plus `INSERT, UPDATE` on
-///   `ironqueue.migrations` while a migration is pending.
-///
-/// The schema has no sequences, so no `GRANT ... ON SEQUENCE` is ever needed.
-/// The three functions carry only PostgreSQL's default `EXECUTE TO PUBLIC`, so a
-/// deployment that runs `REVOKE ALL ON ALL FUNCTIONS IN SCHEMA ironqueue FROM
-/// PUBLIC` must re-grant them by name — without `job_is_stuck` the sweeper
-/// fails while enqueueing keeps working, which is a loss of recovery and
-/// nothing else. Four grants share that shape, and a deployment that trims
-/// privileges should treat them as one group: `EXECUTE` on `job_is_stuck`,
-/// `DELETE` on `jobs`, `UPDATE` on `jobs`, and `SELECT` on `workers` (which
-/// also fails [`Queue::workers_page`]). Each one leaves enqueueing, counting and paging
-/// working while stuck-job recovery stops.
-///
-/// None of them is silent in a worker: every one surfaces on
-/// [`Worker::health`](crate::Worker::health) as
-/// [`WorkerComponent::Sweeper`](crate::WorkerComponent::Sweeper) and clears
-/// when the grant is restored. It is silent only to something watching the
-/// database rather than the process.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum MigrationMode {
-    /// Validate applied migrations and apply any pending migrations. Requires
-    /// DDL privileges on every connect and takes a per-database advisory lock;
-    /// see the privilege table above before using it as a deployment's steady
-    /// state.
-    Apply,
-    /// Validate versions and checksums without executing DDL. The mode a
-    /// least-privilege deployment runs in.
-    #[default]
-    Validate,
-    /// Skip all schema checks. Intended only for externally managed schemas.
-    ///
-    /// The check is skipped, not deferred: connecting to a database with no
-    /// `ironqueue` schema at all succeeds, and the failure surfaces on the first
-    /// enqueue as an `Error::Db` naming the missing relation.
-    Skip,
-}
-
 /// Counters accumulated by this queue handle since start.
 ///
 /// Read-only, and `#[non_exhaustive]` so a new counter can be reported without
@@ -636,7 +549,6 @@ pub struct QueueBuilder {
     priorities: (i16, i16),
     sweep_grace: Duration,
     sweep_batch_size: u32,
-    migration_mode: MigrationMode,
     migration_lock_timeout: Duration,
 }
 
@@ -720,24 +632,24 @@ impl QueueBuilder {
         self
     }
 
-    /// Controls whether connecting applies, validates, or skips migrations.
-    /// Default [`MigrationMode::Validate`]. Migrations only ever move a database
-    /// forward — see [`MigrationMode`] for what that means for rollbacks.
-    pub fn migration_mode(mut self, mode: MigrationMode) -> Self {
-        self.migration_mode = mode;
-        self
-    }
-
-    /// Maximum time [`MigrationMode::Apply`] waits to acquire a PostgreSQL lock.
-    /// Default 30 seconds. The previous session setting is restored before a
-    /// caller-supplied pool connection is returned.
+    /// Maximum time schema initialization waits for a PostgreSQL lock. Default
+    /// 30 seconds. Connecting with a current migration history does not take
+    /// the migrator's advisory lock. The previous session setting is restored
+    /// before a caller-supplied pool connection is returned.
     pub fn migration_lock_timeout(mut self, timeout: Duration) -> Self {
         self.migration_lock_timeout = timeout;
         self
     }
 
-    /// Connects, verifies the server is PostgreSQL 18+, and handles migrations
-    /// according to [`QueueBuilder::migration_mode`].
+    /// Connects, verifies the server is PostgreSQL 18+, and applies missing
+    /// IronQueue migrations.
+    ///
+    /// A current migration history is checked without DDL or the migrator's
+    /// advisory lock. Applying a migration needs DDL privileges. A deployment
+    /// with a restricted application role can run the published
+    /// `ironqueue-migrate` command with a schema-owner role before starting the
+    /// application. Migration history does not detect or repair tables, indexes,
+    /// or other objects changed manually after a migration ran.
     ///
     /// # Durability
     ///
@@ -768,7 +680,6 @@ impl QueueBuilder {
                     sweep_batch_size: self.sweep_batch_size,
                     max_connections: self.max_connections,
                     min_connections: self.min_connections,
-                    migration_mode: self.migration_mode,
                     migration_lock_timeout: self.migration_lock_timeout,
                 })
                 .await?,
@@ -778,10 +689,10 @@ impl QueueBuilder {
 }
 
 impl Queue {
-    /// Connects to queue `default` in the `ironqueue` schema and applies
+    /// Connects to queue `default` in the `ironqueue` schema and applies missing
     /// migrations. Use [`Queue::builder`] to customize the queue or pool.
     pub async fn connect(url: &str) -> Result<Queue, Error> {
-        Queue::builder(url).migration_mode(MigrationMode::Apply).connect().await
+        Queue::builder(url).connect().await
     }
 
     /// Starts configuring a queue connection.
@@ -795,7 +706,6 @@ impl Queue {
             priorities: (i16::MIN, i16::MAX),
             sweep_grace: Duration::from_secs(5),
             sweep_batch_size: 500,
-            migration_mode: MigrationMode::Validate,
             migration_lock_timeout: Duration::from_secs(30),
         }
     }

@@ -797,7 +797,7 @@ mod macro_telemetry {
 mod wait_without_notifications {
     use std::time::Duration;
 
-    use ironqueue::{MigrationMode, Queue, Worker};
+    use ironqueue::{Queue, Worker};
     use tokio_util::sync::CancellationToken;
 
     #[ironqueue::job(name = "wait_without_listener", max_attempts = 1)]
@@ -826,8 +826,7 @@ mod wait_without_notifications {
             .unwrap();
         crate::warm_pool(&pool, 2).await;
         crate::revoke_connect(&url, &client_url).await;
-        let client_queue =
-            Queue::builder(&client_url).pool(pool).migration_mode(MigrationMode::Skip).connect().await.unwrap();
+        let client_queue = Queue::builder(&client_url).pool(pool).connect().await.unwrap();
 
         let shutdown = CancellationToken::new();
         let worker = Worker::builder(admin_queue.clone())
@@ -865,8 +864,7 @@ mod wait_without_notifications {
             .connect(&client_url)
             .await
             .unwrap();
-        let client_queue =
-            Queue::builder(&client_url).pool(pool).migration_mode(MigrationMode::Skip).connect().await.unwrap();
+        let client_queue = Queue::builder(&client_url).pool(pool).connect().await.unwrap();
 
         let handle = client_queue
             .enqueue(wait_without_listener::job(()))

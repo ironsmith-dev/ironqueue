@@ -677,6 +677,8 @@ async fn test_unacknowledged_dequeue_claims_are_requeued_with_the_attempt_refund
     .await
     .unwrap();
     assert_eq!(resolved, 1, "only the committed claim matches a row");
+    assert_eq!(db.queue.stats().retried, 0, "an attempt that never ran is refunded, not retried");
+    assert_eq!(db.queue.stats().aborted, 0);
 
     let requeued = db.queue.fetch_job(committed).await.unwrap().expect("committed row is retained");
     assert_eq!(requeued.status, JobStatus::Queued);
@@ -910,6 +912,8 @@ async fn test_unacknowledged_claim_at_the_attempt_ceiling_is_finished_aborted(po
     assert_eq!(row.status, JobStatus::Aborted);
     assert_eq!(row.error.as_deref(), Some("dequeue commit was not acknowledged"));
     assert_eq!(row.result, None);
+    assert_eq!(db.queue.stats().aborted, 1);
+    assert_eq!(db.queue.stats().retried, 0);
 }
 
 /// Resolution is ordered strictly behind the claim transaction it resolves:

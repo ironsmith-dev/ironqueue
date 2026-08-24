@@ -12,8 +12,12 @@ use std::time::Duration;
 
 use cronexpr::{Crontab, FallbackTimezoneOption, MakeTimestamp, ParseOptions};
 use jiff::{RoundMode, SignedDuration, Timestamp, TimestampRound, Unit};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::ser::{
+    SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant, SerializeTuple, SerializeTupleStruct,
+    SerializeTupleVariant,
+};
+use serde::{Serialize, Serializer};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -1717,9 +1721,10 @@ pub(crate) fn validate_dedupe_key(key: &str) -> Result<(), Error> {
 /// text alike) maps a non-finite float to `null` instead of erroring. Enqueue
 /// then succeeded and the worker terminally failed the job on a deterministic
 /// decode error — or worse, an `Option<f64>` of NaN round-tripped as a clean
-/// `None`, which is silent corruption. The checking pass costs one extra walk
-/// over the value and buys the refusal happening here, at the boundary,
-/// exactly as NUL and nesting depth are refused.
+/// `None`, which is silent corruption. The adapter checks values during the
+/// real JSON serialization, so user-provided [`Serialize`] implementations run
+/// once and the refusal still happens here, at the boundary, exactly as NUL and
+/// nesting depth are refused.
 ///
 /// One member of that family is *not* refused, because it is representable and
 /// refusing it would be over-strict: `-0.0` round-trips as `+0.0`. `jsonb`
@@ -1728,269 +1733,269 @@ pub(crate) fn validate_dedupe_key(key: &str) -> Result<(), Error> {
 /// a sign bit to recover a direction, say — must encode that distinction some
 /// other way. Everything else about the value survives bit for bit.
 pub(crate) fn encode_json<T: Serialize>(value: &T) -> Result<Value, serde_json::Error> {
-    value.serialize(RejectNonFinite)?;
-    serde_json::to_value(value)
+    serde_json::to_value(CheckedJson(value))
 }
 
-/// The checking pass behind [`encode_json`]: a sink serializer that produces
-/// nothing and accepts everything except a non-finite float. Inspecting the
-/// finished tree cannot do this job — by then a NaN is indistinguishable from
-/// a deliberate `null` — so the check runs against the typed value itself.
-struct RejectNonFinite;
+/// Wraps each nested value before the real JSON serializer sees it. The root
+/// and every child are serialized exactly once; the serializer adapter gets to
+/// inspect floats before forwarding them.
+struct CheckedJson<'a, T: ?Sized>(&'a T);
 
-/// Non-scalar range checks (128-bit integers that overflow JSON numbers) are
-/// left to [`serde_json::to_value`], which `encode_json` runs right after this
-/// pass; this sink only rejects what `to_value` would silently mangle.
-impl serde::Serializer for RejectNonFinite {
-    type Ok = ();
-    type Error = serde_json::Error;
-    type SerializeSeq = Self;
-    type SerializeTuple = Self;
-    type SerializeTupleStruct = Self;
-    type SerializeTupleVariant = Self;
-    type SerializeMap = Self;
-    type SerializeStruct = Self;
-    type SerializeStructVariant = Self;
+impl<T: ?Sized + Serialize> Serialize for CheckedJson<'_, T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(RejectNonFinite(serializer))
+    }
+}
 
-    fn serialize_f32(self, value: f32) -> Result<(), serde_json::Error> {
-        self.serialize_f64(f64::from(value))
+struct RejectNonFinite<S>(S);
+struct CheckedCompound<C>(C);
+
+macro_rules! forward_scalar {
+    ($(fn $method:ident($kind:ty);)*) => {
+        $(
+            fn $method(self, value: $kind) -> Result<Self::Ok, Self::Error> {
+                self.0.$method(value)
+            }
+        )*
+    };
+}
+
+impl<S: Serializer> Serializer for RejectNonFinite<S> {
+    type Ok = S::Ok;
+    type Error = S::Error;
+    type SerializeSeq = CheckedCompound<S::SerializeSeq>;
+    type SerializeTuple = CheckedCompound<S::SerializeTuple>;
+    type SerializeTupleStruct = CheckedCompound<S::SerializeTupleStruct>;
+    type SerializeTupleVariant = CheckedCompound<S::SerializeTupleVariant>;
+    type SerializeMap = CheckedCompound<S::SerializeMap>;
+    type SerializeStruct = CheckedCompound<S::SerializeStruct>;
+    type SerializeStructVariant = CheckedCompound<S::SerializeStructVariant>;
+
+    forward_scalar! {
+        fn serialize_bool(bool);
+        fn serialize_i8(i8);
+        fn serialize_i16(i16);
+        fn serialize_i32(i32);
+        fn serialize_i64(i64);
+        fn serialize_i128(i128);
+        fn serialize_u8(u8);
+        fn serialize_u16(u16);
+        fn serialize_u32(u32);
+        fn serialize_u64(u64);
+        fn serialize_u128(u128);
+        fn serialize_char(char);
     }
 
-    fn serialize_f64(self, value: f64) -> Result<(), serde_json::Error> {
-        if value.is_finite() {
-            Ok(())
-        } else {
-            Err(serde::ser::Error::custom("non-finite floats (NaN, infinity) have no JSON representation"))
+    fn serialize_f32(self, value: f32) -> Result<Self::Ok, Self::Error> {
+        if !value.is_finite() {
+            return Err(serde::ser::Error::custom("non-finite floats (NaN, infinity) have no JSON representation"));
         }
+        self.0.serialize_f32(value)
     }
 
-    fn serialize_bool(self, _: bool) -> Result<(), serde_json::Error> {
-        Ok(())
+    fn serialize_f64(self, value: f64) -> Result<Self::Ok, Self::Error> {
+        if !value.is_finite() {
+            return Err(serde::ser::Error::custom("non-finite floats (NaN, infinity) have no JSON representation"));
+        }
+        self.0.serialize_f64(value)
     }
 
-    fn serialize_i8(self, _: i8) -> Result<(), serde_json::Error> {
-        Ok(())
+    fn serialize_str(self, value: &str) -> Result<Self::Ok, Self::Error> {
+        self.0.serialize_str(value)
     }
 
-    fn serialize_i16(self, _: i16) -> Result<(), serde_json::Error> {
-        Ok(())
+    fn serialize_bytes(self, value: &[u8]) -> Result<Self::Ok, Self::Error> {
+        self.0.serialize_bytes(value)
     }
 
-    fn serialize_i32(self, _: i32) -> Result<(), serde_json::Error> {
-        Ok(())
+    fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
+        self.0.serialize_none()
     }
 
-    fn serialize_i64(self, _: i64) -> Result<(), serde_json::Error> {
-        Ok(())
+    fn serialize_some<T: ?Sized + Serialize>(self, value: &T) -> Result<Self::Ok, Self::Error> {
+        self.0.serialize_some(&CheckedJson(value))
     }
 
-    fn serialize_i128(self, _: i128) -> Result<(), serde_json::Error> {
-        Ok(())
+    fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
+        self.0.serialize_unit()
     }
 
-    fn serialize_u8(self, _: u8) -> Result<(), serde_json::Error> {
-        Ok(())
+    fn serialize_unit_struct(self, name: &'static str) -> Result<Self::Ok, Self::Error> {
+        self.0.serialize_unit_struct(name)
     }
 
-    fn serialize_u16(self, _: u16) -> Result<(), serde_json::Error> {
-        Ok(())
-    }
-
-    fn serialize_u32(self, _: u32) -> Result<(), serde_json::Error> {
-        Ok(())
-    }
-
-    fn serialize_u64(self, _: u64) -> Result<(), serde_json::Error> {
-        Ok(())
-    }
-
-    fn serialize_u128(self, _: u128) -> Result<(), serde_json::Error> {
-        Ok(())
-    }
-
-    fn serialize_char(self, _: char) -> Result<(), serde_json::Error> {
-        Ok(())
-    }
-
-    fn serialize_str(self, _: &str) -> Result<(), serde_json::Error> {
-        Ok(())
-    }
-
-    fn serialize_bytes(self, _: &[u8]) -> Result<(), serde_json::Error> {
-        Ok(())
-    }
-
-    fn serialize_none(self) -> Result<(), serde_json::Error> {
-        Ok(())
-    }
-
-    fn serialize_some<T: ?Sized + Serialize>(self, value: &T) -> Result<(), serde_json::Error> {
-        value.serialize(self)
-    }
-
-    fn serialize_unit(self) -> Result<(), serde_json::Error> {
-        Ok(())
-    }
-
-    fn serialize_unit_struct(self, _: &'static str) -> Result<(), serde_json::Error> {
-        Ok(())
-    }
-
-    fn serialize_unit_variant(self, _: &'static str, _: u32, _: &'static str) -> Result<(), serde_json::Error> {
-        Ok(())
+    fn serialize_unit_variant(
+        self,
+        name: &'static str,
+        variant_index: u32,
+        variant: &'static str,
+    ) -> Result<Self::Ok, Self::Error> {
+        self.0.serialize_unit_variant(name, variant_index, variant)
     }
 
     fn serialize_newtype_struct<T: ?Sized + Serialize>(
         self,
-        _: &'static str,
+        name: &'static str,
         value: &T,
-    ) -> Result<(), serde_json::Error> {
-        value.serialize(self)
+    ) -> Result<Self::Ok, Self::Error> {
+        self.0.serialize_newtype_struct(name, &CheckedJson(value))
     }
 
     fn serialize_newtype_variant<T: ?Sized + Serialize>(
         self,
-        _: &'static str,
-        _: u32,
-        _: &'static str,
+        name: &'static str,
+        variant_index: u32,
+        variant: &'static str,
         value: &T,
-    ) -> Result<(), serde_json::Error> {
-        value.serialize(self)
+    ) -> Result<Self::Ok, Self::Error> {
+        self.0.serialize_newtype_variant(name, variant_index, variant, &CheckedJson(value))
     }
 
-    fn serialize_seq(self, _: Option<usize>) -> Result<Self, serde_json::Error> {
-        Ok(self)
+    fn serialize_seq(self, length: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
+        self.0.serialize_seq(length).map(CheckedCompound)
     }
 
-    fn serialize_tuple(self, _: usize) -> Result<Self, serde_json::Error> {
-        Ok(self)
+    fn serialize_tuple(self, length: usize) -> Result<Self::SerializeTuple, Self::Error> {
+        self.0.serialize_tuple(length).map(CheckedCompound)
     }
 
-    fn serialize_tuple_struct(self, _: &'static str, _: usize) -> Result<Self, serde_json::Error> {
-        Ok(self)
+    fn serialize_tuple_struct(
+        self,
+        name: &'static str,
+        length: usize,
+    ) -> Result<Self::SerializeTupleStruct, Self::Error> {
+        self.0.serialize_tuple_struct(name, length).map(CheckedCompound)
     }
 
     fn serialize_tuple_variant(
         self,
-        _: &'static str,
-        _: u32,
-        _: &'static str,
-        _: usize,
-    ) -> Result<Self, serde_json::Error> {
-        Ok(self)
+        name: &'static str,
+        variant_index: u32,
+        variant: &'static str,
+        length: usize,
+    ) -> Result<Self::SerializeTupleVariant, Self::Error> {
+        self.0.serialize_tuple_variant(name, variant_index, variant, length).map(CheckedCompound)
     }
 
-    fn serialize_map(self, _: Option<usize>) -> Result<Self, serde_json::Error> {
-        Ok(self)
+    fn serialize_map(self, length: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
+        self.0.serialize_map(length).map(CheckedCompound)
     }
 
-    fn serialize_struct(self, _: &'static str, _: usize) -> Result<Self, serde_json::Error> {
-        Ok(self)
+    fn serialize_struct(self, name: &'static str, length: usize) -> Result<Self::SerializeStruct, Self::Error> {
+        self.0.serialize_struct(name, length).map(CheckedCompound)
     }
 
     fn serialize_struct_variant(
         self,
-        _: &'static str,
-        _: u32,
-        _: &'static str,
-        _: usize,
-    ) -> Result<Self, serde_json::Error> {
-        Ok(self)
+        name: &'static str,
+        variant_index: u32,
+        variant: &'static str,
+        length: usize,
+    ) -> Result<Self::SerializeStructVariant, Self::Error> {
+        self.0.serialize_struct_variant(name, variant_index, variant, length).map(CheckedCompound)
+    }
+
+    fn collect_str<T: ?Sized + std::fmt::Display>(self, value: &T) -> Result<Self::Ok, Self::Error> {
+        self.0.collect_str(value)
+    }
+
+    fn is_human_readable(&self) -> bool {
+        self.0.is_human_readable()
     }
 }
 
-impl serde::ser::SerializeSeq for RejectNonFinite {
-    type Ok = ();
-    type Error = serde_json::Error;
+impl<C: SerializeSeq> SerializeSeq for CheckedCompound<C> {
+    type Ok = C::Ok;
+    type Error = C::Error;
 
-    fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), serde_json::Error> {
-        value.serialize(RejectNonFinite)
+    fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
+        self.0.serialize_element(&CheckedJson(value))
     }
 
-    fn end(self) -> Result<(), serde_json::Error> {
-        Ok(())
-    }
-}
-
-impl serde::ser::SerializeTuple for RejectNonFinite {
-    type Ok = ();
-    type Error = serde_json::Error;
-
-    fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), serde_json::Error> {
-        value.serialize(RejectNonFinite)
-    }
-
-    fn end(self) -> Result<(), serde_json::Error> {
-        Ok(())
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        self.0.end()
     }
 }
 
-impl serde::ser::SerializeTupleStruct for RejectNonFinite {
-    type Ok = ();
-    type Error = serde_json::Error;
+impl<C: SerializeTuple> SerializeTuple for CheckedCompound<C> {
+    type Ok = C::Ok;
+    type Error = C::Error;
 
-    fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), serde_json::Error> {
-        value.serialize(RejectNonFinite)
+    fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
+        self.0.serialize_element(&CheckedJson(value))
     }
 
-    fn end(self) -> Result<(), serde_json::Error> {
-        Ok(())
-    }
-}
-
-impl serde::ser::SerializeTupleVariant for RejectNonFinite {
-    type Ok = ();
-    type Error = serde_json::Error;
-
-    fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), serde_json::Error> {
-        value.serialize(RejectNonFinite)
-    }
-
-    fn end(self) -> Result<(), serde_json::Error> {
-        Ok(())
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        self.0.end()
     }
 }
 
-impl serde::ser::SerializeMap for RejectNonFinite {
-    type Ok = ();
-    type Error = serde_json::Error;
+impl<C: SerializeTupleStruct> SerializeTupleStruct for CheckedCompound<C> {
+    type Ok = C::Ok;
+    type Error = C::Error;
 
-    fn serialize_key<T: ?Sized + Serialize>(&mut self, key: &T) -> Result<(), serde_json::Error> {
-        key.serialize(RejectNonFinite)
+    fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
+        self.0.serialize_field(&CheckedJson(value))
     }
 
-    fn serialize_value<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), serde_json::Error> {
-        value.serialize(RejectNonFinite)
-    }
-
-    fn end(self) -> Result<(), serde_json::Error> {
-        Ok(())
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        self.0.end()
     }
 }
 
-impl serde::ser::SerializeStruct for RejectNonFinite {
-    type Ok = ();
-    type Error = serde_json::Error;
+impl<C: SerializeTupleVariant> SerializeTupleVariant for CheckedCompound<C> {
+    type Ok = C::Ok;
+    type Error = C::Error;
 
-    fn serialize_field<T: ?Sized + Serialize>(&mut self, _: &'static str, value: &T) -> Result<(), serde_json::Error> {
-        value.serialize(RejectNonFinite)
+    fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
+        self.0.serialize_field(&CheckedJson(value))
     }
 
-    fn end(self) -> Result<(), serde_json::Error> {
-        Ok(())
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        self.0.end()
     }
 }
 
-impl serde::ser::SerializeStructVariant for RejectNonFinite {
-    type Ok = ();
-    type Error = serde_json::Error;
+impl<C: SerializeMap> SerializeMap for CheckedCompound<C> {
+    type Ok = C::Ok;
+    type Error = C::Error;
 
-    fn serialize_field<T: ?Sized + Serialize>(&mut self, _: &'static str, value: &T) -> Result<(), serde_json::Error> {
-        value.serialize(RejectNonFinite)
+    fn serialize_key<T: ?Sized + Serialize>(&mut self, key: &T) -> Result<(), Self::Error> {
+        self.0.serialize_key(&CheckedJson(key))
     }
 
-    fn end(self) -> Result<(), serde_json::Error> {
-        Ok(())
+    fn serialize_value<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
+        self.0.serialize_value(&CheckedJson(value))
+    }
+
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        self.0.end()
+    }
+}
+
+impl<C: SerializeStruct> SerializeStruct for CheckedCompound<C> {
+    type Ok = C::Ok;
+    type Error = C::Error;
+
+    fn serialize_field<T: ?Sized + Serialize>(&mut self, key: &'static str, value: &T) -> Result<(), Self::Error> {
+        self.0.serialize_field(key, &CheckedJson(value))
+    }
+
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        self.0.end()
+    }
+}
+
+impl<C: SerializeStructVariant> SerializeStructVariant for CheckedCompound<C> {
+    type Ok = C::Ok;
+    type Error = C::Error;
+
+    fn serialize_field<T: ?Sized + Serialize>(&mut self, key: &'static str, value: &T) -> Result<(), Self::Error> {
+        self.0.serialize_field(key, &CheckedJson(value))
+    }
+
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        self.0.end()
     }
 }
 
@@ -2781,7 +2786,19 @@ fn resolve(outcome: crate::database::DatabaseJobOutcome) -> Result<Value, Error>
 
 #[cfg(test)]
 mod api_tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    struct StatefulFloat<'a>(&'a Cell<u32>);
+
+    impl Serialize for StatefulFloat<'_> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let calls = self.0.get();
+            self.0.set(calls + 1);
+            serializer.serialize_f64(if calls == 0 { 1.5 } else { f64::NAN })
+        }
+    }
 
     #[test]
     fn test_new_job_uses_expected_defaults() {
@@ -2874,6 +2891,13 @@ mod api_tests {
             let nested: Vec<Option<f64>> = vec![Some(1.0), Some(bad)];
             assert!(encode_json(&nested).is_err(), "a nested {bad} must be refused");
         }
+    }
+
+    #[test]
+    fn test_typed_encoding_serializes_user_values_once() {
+        let calls = Cell::new(0);
+        assert_eq!(encode_json(&StatefulFloat(&calls)).unwrap(), serde_json::json!(1.5));
+        assert_eq!(calls.get(), 1);
     }
 
     /// A negative TTL has no encoding, but decoding one as a live zero-length

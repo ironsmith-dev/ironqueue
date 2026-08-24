@@ -18,7 +18,7 @@ use crate::job::{
     duration_to_ms, duration_to_ms_checked, truncate_stored_error, validate_duration, validate_json_document,
     validate_nonzero_duration,
 };
-use crate::queue::{MigrationMode, QueueCounters, QueueCounts, QueueNotifyListener, QueueStats};
+use crate::queue::{QueueCounters, QueueCounts, QueueNotifyListener, QueueStats};
 use crate::sweeper::{SWEPT, Sweeper, is_swept_marked, swept_marker};
 use crate::worker::{WorkerCursor, WorkerInfo};
 
@@ -71,7 +71,12 @@ struct DatabaseServer {
     isolation: String,
 }
 
-async fn current_migrations(pool: &PgPool) -> Result<Vec<AppliedMigration>, sqlx::Error> {
+enum MigrationStatus {
+    Current,
+    Pending,
+}
+
+async fn find_applied_migrations(connection: &mut PgConnection) -> Result<Vec<AppliedMigration>, sqlx::Error> {
     sqlx::query_as::<_, AppliedMigration>(
         r#"
         SELECT version, checksum, success
@@ -79,17 +84,15 @@ async fn current_migrations(pool: &PgPool) -> Result<Vec<AppliedMigration>, sqlx
         ORDER BY version
         "#,
     )
-    .fetch_all(pool)
+    .fetch_all(connection)
     .await
 }
 
-async fn validate_migrations(pool: &PgPool) -> Result<(), Error> {
-    let applied = match current_migrations(pool).await {
+async fn find_migration_status(connection: &mut PgConnection) -> Result<MigrationStatus, Error> {
+    let applied = match find_applied_migrations(connection).await {
         Ok(applied) => applied,
         Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some(UNDEFINED_TABLE) => {
-            return Err(Error::Config(
-                "database is missing ironqueue migrations; run once with MigrationMode::Apply".into(),
-            ));
+            return Ok(MigrationStatus::Pending);
         }
         Err(error) => return Err(error.into()),
     };
@@ -102,22 +105,24 @@ async fn validate_migrations(pool: &PgPool) -> Result<(), Error> {
 
     let expected =
         MIGRATOR.iter().filter(|migration| !migration.migration_type.is_down_migration()).collect::<Vec<_>>();
-    for row in &applied {
-        let Some(migration) = expected.iter().find(|migration| migration.version == row.version) else {
+    for (index, row) in applied.iter().enumerate() {
+        let Some(migration) = expected.get(index) else {
             return Err(Error::Migration(sqlx::migrate::MigrateError::VersionMissing(row.version)));
         };
+        if migration.version != row.version {
+            if !expected.iter().any(|migration| migration.version == row.version) {
+                return Err(Error::Migration(sqlx::migrate::MigrateError::VersionMissing(row.version)));
+            }
+            return Err(Error::Config(format!(
+                "ironqueue migration history is not an applied prefix: expected version {}, found {}",
+                migration.version, row.version
+            )));
+        }
         if migration.checksum.as_ref() != row.checksum.as_slice() {
             return Err(Error::Migration(sqlx::migrate::MigrateError::VersionMismatch(row.version)));
         }
     }
-    if let Some(missing) = expected.iter().find(|migration| !applied.iter().any(|row| row.version == migration.version))
-    {
-        return Err(Error::Config(format!(
-            "database is missing ironqueue migration {} ({})",
-            missing.version, missing.description
-        )));
-    }
-    Ok(())
+    if applied.len() == expected.len() { Ok(MigrationStatus::Current) } else { Ok(MigrationStatus::Pending) }
 }
 
 struct MigrationConnectionGuard<'a> {
@@ -155,7 +160,7 @@ async fn set_lock_timeout(connection: &mut PgConnection, value: &str) -> Result<
     Ok(())
 }
 
-async fn apply_migrations(pool: &PgPool, lock_timeout: Duration) -> Result<(), Error> {
+async fn ensure_migrations(pool: &PgPool, lock_timeout: Duration) -> Result<(), Error> {
     let mut pooled = pool.acquire().await?;
     let mut connection = MigrationConnectionGuard::new(&mut pooled);
     let previous_lock_timeout = sqlx::query_scalar::<_, String>("SELECT current_setting('lock_timeout')")
@@ -166,7 +171,52 @@ async fn apply_migrations(pool: &PgPool, lock_timeout: Duration) -> Result<(), E
             .filter(|milliseconds| *milliseconds <= i64::from(i32::MAX))
             .ok_or_else(|| Error::Config("migration lock timeout must fit PostgreSQL's integer milliseconds".into()))?;
     set_lock_timeout(connection.connection(), &format!("{timeout_ms}ms")).await?;
-    let result = MIGRATOR.run_direct(None, connection.connection(), false).await;
+
+    match find_migration_status(connection.connection()).await {
+        Ok(MigrationStatus::Current) => {
+            set_lock_timeout(connection.connection(), &previous_lock_timeout).await?;
+            connection.disarm();
+            return Ok(());
+        }
+        Ok(MigrationStatus::Pending) => {}
+        Err(error) => {
+            if set_lock_timeout(connection.connection(), &previous_lock_timeout).await.is_ok() {
+                connection.disarm();
+            }
+            return Err(error);
+        }
+    }
+
+    if let Err(error) = connection.connection().lock().await {
+        if set_lock_timeout(connection.connection(), &previous_lock_timeout).await.is_ok() {
+            connection.disarm();
+        }
+        return Err(Error::Migration(error));
+    }
+
+    match find_migration_status(connection.connection()).await {
+        Ok(MigrationStatus::Current) => {
+            connection.connection().unlock().await?;
+            set_lock_timeout(connection.connection(), &previous_lock_timeout).await?;
+            connection.disarm();
+            return Ok(());
+        }
+        Ok(MigrationStatus::Pending) => {}
+        Err(error) => {
+            let unlocked = connection.connection().unlock().await.is_ok();
+            let restored = set_lock_timeout(connection.connection(), &previous_lock_timeout).await.is_ok();
+            if unlocked && restored {
+                connection.disarm();
+            }
+            return Err(error);
+        }
+    }
+
+    // The status was rechecked while this connection held SQLx's migration
+    // lock, so the migrator must not acquire the same session lock again.
+    let mut migrator = sqlx::migrate!();
+    migrator.set_locking(false);
+    let result = migrator.run_direct(None, connection.connection(), false).await;
     if let Err(error) = result {
         let unlocked = connection.connection().unlock().await.is_ok();
         let restored = set_lock_timeout(connection.connection(), &previous_lock_timeout).await.is_ok();
@@ -175,6 +225,7 @@ async fn apply_migrations(pool: &PgPool, lock_timeout: Duration) -> Result<(), E
         }
         return Err(Error::Migration(error));
     }
+    connection.connection().unlock().await?;
     set_lock_timeout(connection.connection(), &previous_lock_timeout).await?;
     connection.disarm();
     Ok(())
@@ -296,7 +347,7 @@ pub(crate) struct Database {
     sweep_batch_size: i64,
     notify_channel: String,
     done_channel: String,
-    counters: QueueCounters,
+    counters: std::sync::Arc<QueueCounters>,
     notify_listener: std::sync::OnceLock<QueueNotifyListener>,
 }
 
@@ -309,7 +360,6 @@ pub(crate) struct DatabaseConnectOptions {
     pub(crate) priorities: (i16, i16),
     pub(crate) sweep_grace: Duration,
     pub(crate) sweep_batch_size: u32,
-    pub(crate) migration_mode: MigrationMode,
     pub(crate) migration_lock_timeout: Duration,
 }
 
@@ -652,6 +702,16 @@ pub(crate) struct DatabaseUnacknowledgedClaim {
     pub(crate) attempts: i32,
 }
 
+#[derive(Clone)]
+struct RecoveryContext {
+    pool: PgPool,
+    counters: std::sync::Arc<QueueCounters>,
+    queue: String,
+    notify_channel: String,
+    done_channel: String,
+    claim_lock_key: i32,
+}
+
 /// The `error` stored on a row the resolver reclaims, so the dashboard shows
 /// why the occurrence moved back to `queued` without ever reporting a result.
 const UNACKNOWLEDGED_CLAIM_ERROR: &str = "dequeue commit was not acknowledged";
@@ -841,11 +901,7 @@ impl Database {
             )));
         }
 
-        match options.migration_mode {
-            MigrationMode::Apply => apply_migrations(&pool, options.migration_lock_timeout).await?,
-            MigrationMode::Validate => validate_migrations(&pool).await?,
-            MigrationMode::Skip => {}
-        }
+        ensure_migrations(&pool, options.migration_lock_timeout).await?;
 
         Ok(Self {
             notify_channel: channel_name(&options.name, ""),
@@ -858,7 +914,7 @@ impl Database {
             priorities: options.priorities,
             sweep_grace: options.sweep_grace,
             sweep_batch_size: i64::from(options.sweep_batch_size),
-            counters: QueueCounters::default(),
+            counters: std::sync::Arc::new(QueueCounters::default()),
             notify_listener: std::sync::OnceLock::new(),
         })
     }
@@ -873,13 +929,6 @@ impl Database {
 
     pub(crate) fn sweep_lock_key(&self) -> i64 {
         self.sweep_lock_key
-    }
-
-    /// Only [`crate::__test_support`] reads the key back; the library's own
-    /// callers reach it through the `Database` field directly.
-    #[cfg(feature = "_test")]
-    pub(crate) fn claim_resolution_lock_key(&self) -> i32 {
-        self.claim_resolution_lock_key
     }
 
     /// The inclusive priority window this queue's claims are restricted to.
@@ -913,6 +962,26 @@ impl Database {
 
     pub(crate) fn stats(&self) -> QueueStats {
         self.counters.snapshot()
+    }
+
+    fn recovery_context(&self) -> RecoveryContext {
+        RecoveryContext {
+            pool: self.pool.clone(),
+            counters: std::sync::Arc::clone(&self.counters),
+            queue: self.name.clone(),
+            notify_channel: self.notify_channel.clone(),
+            done_channel: self.done_channel.clone(),
+            claim_lock_key: self.claim_resolution_lock_key,
+        }
+    }
+
+    #[cfg(feature = "_test")]
+    pub(crate) async fn requeue_unacknowledged_claims(
+        &self,
+        worker_id: Uuid,
+        claims: &mut Vec<DatabaseUnacknowledgedClaim>,
+    ) -> Result<u64, sqlx::Error> {
+        requeue_unacknowledged_claims(&self.recovery_context(), worker_id, claims).await
     }
 
     /// The one place a cross-queue job is refused. Every entry point that hands
@@ -2084,12 +2153,8 @@ impl Database {
         // drop its dequeue future at any await. Only the return of the batch,
         // after which no await remains, disarms it.
         let guard = UnacknowledgedClaimGuard {
-            pool: self.pool.clone(),
-            queue: self.name.clone(),
-            notify_channel: self.notify_channel.clone(),
-            done_channel: self.done_channel.clone(),
+            context: self.recovery_context(),
             worker_id,
-            claim_lock_key: self.claim_resolution_lock_key,
             claims: jobs.iter().map(|job| DatabaseUnacknowledgedClaim { id: job.id, attempts: job.attempts }).collect(),
         };
         transaction.commit().await?;
@@ -2711,20 +2776,17 @@ async fn abort_unsettled_claim(
 /// actually reclaimed — a claim whose commit never landed matches no row and
 /// counts nothing, and a committed claim whose refund is refused at the
 /// attempt ceiling is finished `aborted` instead of being abandoned.
-pub(crate) async fn requeue_unacknowledged_claims(
-    pool: &PgPool,
-    queue: &str,
-    notify_channel: &str,
-    done_channel: &str,
+async fn requeue_unacknowledged_claims(
+    context: &RecoveryContext,
     worker_id: Uuid,
-    claim_lock_key: i32,
     claims: &mut Vec<DatabaseUnacknowledgedClaim>,
 ) -> Result<u64, sqlx::Error> {
     if claims.is_empty() {
         return Ok(0);
     }
     let mut requeued = 0;
-    let mut transaction = pool.begin().await?;
+    let mut aborted = 0;
+    let mut transaction = context.pool.begin().await?;
     // Strictly after the claim transaction being resolved: the dequeue takes
     // this pair transaction-scoped inside its claiming statement, so acquiring
     // it here blocks until an in-flight COMMIT has resolved either way. A pass
@@ -2735,7 +2797,7 @@ pub(crate) async fn requeue_unacknowledged_claims(
     // them. The uuid is hashed as its canonical lowercase text, which is what
     // `$5::text` yields in the claim.
     sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
-        .bind(claim_lock_key)
+        .bind(context.claim_lock_key)
         .bind(worker_id.to_string())
         .execute(&mut *transaction)
         .await?;
@@ -2747,7 +2809,7 @@ pub(crate) async fn requeue_unacknowledged_claims(
             .bind(Some(UNACKNOWLEDGED_CLAIM_ERROR))
             .bind(claim.attempts)
             .bind(Some(worker_id))
-            .bind(queue)
+            .bind(&context.queue)
             // Refund: nothing was executed, so nothing was spent.
             .bind(true)
             // The row is `running` if the commit landed, or `aborting` under
@@ -2757,7 +2819,7 @@ pub(crate) async fn requeue_unacknowledged_claims(
             .bind(true)
             .bind(SWEPT)
             .bind(swept_marker())
-            .bind(notify_channel)
+            .bind(&context.notify_channel)
             // The worker is alive and healthy — the lost acknowledgement was
             // the connection's, not the process's — so its intake stays open.
             .bind(false)
@@ -2771,18 +2833,24 @@ pub(crate) async fn requeue_unacknowledged_claims(
             // no-ops below — but a refund refused at the attempt ceiling
             // leaves a row this claim still owns, which must finish rather
             // than sit `running` under an owner that never learned of it.
-            abort_unsettled_claim(
+            if abort_unsettled_claim(
                 &mut transaction,
-                queue,
-                done_channel,
+                &context.queue,
+                &context.done_channel,
                 Some(worker_id),
                 claim,
                 UNACKNOWLEDGED_CLAIM_ERROR,
             )
-            .await?;
+            .await?
+            {
+                aborted += 1;
+            }
         }
     }
     transaction.commit().await?;
+    for _ in 0..aborted {
+        context.counters.record_abort();
+    }
     claims.clear();
     Ok(requeued)
 }
@@ -2806,12 +2874,8 @@ pub(crate) async fn requeue_unacknowledged_claims(
 /// teardown — is that same process exit, so it only logs: lease expiry is
 /// already the answer.
 fn spawn_unacknowledged_claim_resolver(
-    pool: PgPool,
-    queue: String,
-    notify_channel: String,
-    done_channel: String,
+    context: RecoveryContext,
     worker_id: Uuid,
-    claim_lock_key: i32,
     mut claims: Vec<DatabaseUnacknowledgedClaim>,
 ) {
     const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -2820,14 +2884,14 @@ fn spawn_unacknowledged_claim_resolver(
         return;
     }
     tracing::warn!(
-        queue = %queue,
+        queue = %context.queue,
         worker.id = %worker_id,
         job.count = claims.len(),
         "dequeue commit outcome is unknown; resolving the claims in the background"
     );
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         tracing::warn!(
-            queue = %queue,
+            queue = %context.queue,
             worker.id = %worker_id,
             "no runtime to resolve unacknowledged dequeue claims on; lease expiry will recover them"
         );
@@ -2836,20 +2900,10 @@ fn spawn_unacknowledged_claim_resolver(
     runtime.spawn(async move {
         let mut delay = INITIAL_RETRY_DELAY;
         loop {
-            match requeue_unacknowledged_claims(
-                &pool,
-                &queue,
-                &notify_channel,
-                &done_channel,
-                worker_id,
-                claim_lock_key,
-                &mut claims,
-            )
-            .await
-            {
+            match requeue_unacknowledged_claims(&context, worker_id, &mut claims).await {
                 Ok(requeued) => {
                     tracing::warn!(
-                        queue = %queue,
+                        queue = %context.queue,
                         worker.id = %worker_id,
                         job.count = requeued,
                         "resolved unacknowledged dequeue claims"
@@ -2862,7 +2916,7 @@ fn spawn_unacknowledged_claim_resolver(
                 // has, and it covers this one.
                 Err(sqlx::Error::PoolClosed) => {
                     tracing::warn!(
-                        queue = %queue,
+                        queue = %context.queue,
                         worker.id = %worker_id,
                         job.count = claims.len(),
                         "pool closed before unacknowledged dequeue claims resolved; lease expiry will recover them"
@@ -2871,7 +2925,7 @@ fn spawn_unacknowledged_claim_resolver(
                 }
                 Err(error) => {
                     tracing::warn!(
-                        queue = %queue,
+                        queue = %context.queue,
                         worker.id = %worker_id,
                         job.count = claims.len(),
                         %error,
@@ -2894,12 +2948,8 @@ fn spawn_unacknowledged_claim_resolver(
 /// [`UnacknowledgedClaimGuard::disarm`], called when no await remains between
 /// the committed claim and its caller, lets the batch pass without one.
 struct UnacknowledgedClaimGuard {
-    pool: PgPool,
-    queue: String,
-    notify_channel: String,
-    done_channel: String,
+    context: RecoveryContext,
     worker_id: Uuid,
-    claim_lock_key: i32,
     claims: Vec<DatabaseUnacknowledgedClaim>,
 }
 
@@ -2911,15 +2961,7 @@ impl UnacknowledgedClaimGuard {
 
 impl Drop for UnacknowledgedClaimGuard {
     fn drop(&mut self) {
-        spawn_unacknowledged_claim_resolver(
-            self.pool.clone(),
-            std::mem::take(&mut self.queue),
-            std::mem::take(&mut self.notify_channel),
-            std::mem::take(&mut self.done_channel),
-            self.worker_id,
-            self.claim_lock_key,
-            std::mem::take(&mut self.claims),
-        );
+        spawn_unacknowledged_claim_resolver(self.context.clone(), self.worker_id, std::mem::take(&mut self.claims));
     }
 }
 
@@ -2941,10 +2983,7 @@ impl Database {
     /// alone.
     pub(crate) fn spawn_dropped_attempt_recovery(&self, row: &JobRow) {
         spawn_dropped_attempt_resolver(
-            self.pool.clone(),
-            self.name.clone(),
-            self.notify_channel.clone(),
-            self.done_channel.clone(),
+            self.recovery_context(),
             row.worker_id,
             duration_to_ms(row.next_retry_delay()),
             DatabaseUnacknowledgedClaim { id: row.id, attempts: row.attempts },
@@ -2954,25 +2993,28 @@ impl Database {
 
 /// One recovery pass for a dropped, unsettled attempt: the guarded requeue
 /// (attempt spent, the job's own retry delay applied), falling back to the
-/// guarded abort when no retry can be granted. Returns whether the row was
-/// requeued.
+/// guarded abort when no retry can be granted.
+#[derive(Debug, Clone, Copy)]
+enum DroppedAttemptResolution {
+    Requeued,
+    Aborted,
+    Unchanged,
+}
+
 async fn resolve_dropped_attempt(
-    pool: &PgPool,
-    queue: &str,
-    notify_channel: &str,
-    done_channel: &str,
+    context: &RecoveryContext,
     worker_id: Option<Uuid>,
     retry_delay_ms: i64,
     claim: &DatabaseUnacknowledgedClaim,
-) -> Result<bool, sqlx::Error> {
-    let mut transaction = pool.begin().await?;
+) -> Result<DroppedAttemptResolution, sqlx::Error> {
+    let mut transaction = context.pool.begin().await?;
     let row = sqlx::query_as::<_, RequeueResult>(REQUEUE_GUARDED_SQL)
         .bind(claim.id)
         .bind(retry_delay_ms)
         .bind(Some(DROPPED_ATTEMPT_ERROR))
         .bind(claim.attempts)
         .bind(worker_id)
-        .bind(queue)
+        .bind(&context.queue)
         // The attempt was dispatched and may have run arbitrarily far before
         // the drop, so it is spent, not refunded.
         .bind(false)
@@ -2980,15 +3022,28 @@ async fn resolve_dropped_attempt(
         .bind(true)
         .bind(SWEPT)
         .bind(swept_marker())
-        .bind(notify_channel)
+        .bind(&context.notify_channel)
         .bind(false)
         .fetch_one(&mut *transaction)
         .await?;
-    if !row.requeued {
-        abort_unsettled_claim(&mut transaction, queue, done_channel, worker_id, claim, DROPPED_ATTEMPT_ERROR).await?;
-    }
+    let resolution = if row.requeued {
+        DroppedAttemptResolution::Requeued
+    } else if abort_unsettled_claim(
+        &mut transaction,
+        &context.queue,
+        &context.done_channel,
+        worker_id,
+        claim,
+        DROPPED_ATTEMPT_ERROR,
+    )
+    .await?
+    {
+        DroppedAttemptResolution::Aborted
+    } else {
+        DroppedAttemptResolution::Unchanged
+    };
     transaction.commit().await?;
-    Ok(row.requeued)
+    Ok(resolution)
 }
 
 /// Resolves a consumer attempt dropped without settlement, in the background
@@ -2996,10 +3051,7 @@ async fn resolve_dropped_attempt(
 /// resolver that dies with the process is covered by lease expiry, and a
 /// closed pool never reopens, so both bail rather than spin.
 fn spawn_dropped_attempt_resolver(
-    pool: PgPool,
-    queue: String,
-    notify_channel: String,
-    done_channel: String,
+    context: RecoveryContext,
     worker_id: Option<Uuid>,
     retry_delay_ms: i64,
     claim: DatabaseUnacknowledgedClaim,
@@ -3007,14 +3059,14 @@ fn spawn_dropped_attempt_resolver(
     const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(100);
     const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
     tracing::warn!(
-        queue = %queue,
+        queue = %context.queue,
         job.id = %claim.id,
         attempt = claim.attempts,
         "attempt dropped without settlement; recovering it in the background"
     );
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         tracing::warn!(
-            queue = %queue,
+            queue = %context.queue,
             job.id = %claim.id,
             "no runtime to recover a dropped attempt on; lease expiry will recover it"
         );
@@ -3024,30 +3076,32 @@ fn spawn_dropped_attempt_resolver(
         let mut delay = INITIAL_RETRY_DELAY;
         loop {
             match resolve_dropped_attempt(
-                &pool,
-                &queue,
-                &notify_channel,
-                &done_channel,
+                &context,
                 worker_id,
                 retry_delay_ms,
                 &claim,
             )
             .await
             {
-                Ok(requeued) => {
-                    tracing::warn!(queue = %queue, job.id = %claim.id, requeued, "recovered a dropped attempt");
+                Ok(resolution) => {
+                    match resolution {
+                        DroppedAttemptResolution::Requeued => context.counters.record_retry(),
+                        DroppedAttemptResolution::Aborted => context.counters.record_abort(),
+                        DroppedAttemptResolution::Unchanged => {}
+                    }
+                    tracing::warn!(queue = %context.queue, job.id = %claim.id, ?resolution, "recovered a dropped attempt");
                     return;
                 }
                 Err(sqlx::Error::PoolClosed) => {
                     tracing::warn!(
-                        queue = %queue,
+                        queue = %context.queue,
                         job.id = %claim.id,
                         "pool closed before a dropped attempt was recovered; lease expiry will recover it"
                     );
                     return;
                 }
                 Err(error) => {
-                    tracing::warn!(queue = %queue, job.id = %claim.id, %error, "failed to recover a dropped attempt; retrying");
+                    tracing::warn!(queue = %context.queue, job.id = %claim.id, %error, "failed to recover a dropped attempt; retrying");
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(MAX_RETRY_DELAY);
                 }
@@ -3061,13 +3115,5 @@ fn spawn_dropped_attempt_resolver(
 /// mid-commit cancellation.
 #[cfg(feature = "_test")]
 pub(crate) fn drop_armed_claim_guard(database: &Database, worker_id: Uuid, claims: Vec<DatabaseUnacknowledgedClaim>) {
-    drop(UnacknowledgedClaimGuard {
-        pool: database.pool.clone(),
-        queue: database.name.clone(),
-        notify_channel: database.notify_channel.clone(),
-        done_channel: database.done_channel.clone(),
-        worker_id,
-        claim_lock_key: database.claim_resolution_lock_key,
-        claims,
-    });
+    drop(UnacknowledgedClaimGuard { context: database.recovery_context(), worker_id, claims });
 }

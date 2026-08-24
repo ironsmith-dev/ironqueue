@@ -203,6 +203,11 @@ async fn main() -> anyhow::Result<()> {
 - At-least-once delivery (requires PostgreSQL to have `fsync` and `synchronous_commit` enabled).
 - Job payloads, job results, job metadata, worker stats, and worker metadata are each limited to 1 MiB of serialized
   JSON. IronQueue rejects oversized documents before writing anything.
-- `Queue::connect` applies pending database migrations automatically. The PostgreSQL role must be allowed to create the
-  `ironqueue` schema and create tables/objects inside. The migrator holds an exclusive PostgreSQL advisory lock while
-  migrations run to ensure only one migration runs at a time.
+- Every queue connection checks IronQueue's migration history and applies missing migrations automatically. A current
+  history only needs read access to `ironqueue.migrations`; it does not run DDL or take the migrator's advisory lock.
+  Migration history does not detect or repair a table, index, or other object changed manually after its migration ran.
+  The first connection to a new database, and the first connection after an upgrade, needs permission to create or
+  update IronQueue's schema.
+- A least-privilege deployment can install the published migration command with `cargo install ironqueue`, then run
+  `DATABASE_URL=postgres://schema-owner:password@host/database ironqueue-migrate` as its release step. The application
+  can then start with its normal restricted database role.

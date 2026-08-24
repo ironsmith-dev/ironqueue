@@ -110,7 +110,7 @@ pub use job::{
     JobCursor, JobDefinition, JobError, JobErrorKind, JobFilter, JobHandle, JobRetention, JobRetryBackoff, JobRow,
     JobState, JobStatus, JobType,
 };
-pub use queue::{Attempt, Consumer, MigrationMode, Queue, QueueBuilder, QueueCounts, QueueStats};
+pub use queue::{Attempt, Consumer, Queue, QueueBuilder, QueueCounts, QueueStats};
 pub use sweeper::{SweepOperations, Sweeper, SweeperReport};
 pub use worker::{
     Worker, WorkerBuilder, WorkerComponent, WorkerCursor, WorkerFilter, WorkerHealth, WorkerHealthFailure,
@@ -321,7 +321,7 @@ pub mod __test_support {
     use serde_json::Value;
     use uuid::Uuid;
 
-    use crate::{Dashboard, Error, JobRow, JobStatus, Queue, Sweeper};
+    use crate::{Dashboard, Error, JobRow, JobStatus, Queue, Sweeper, Worker};
 
     /// The serialized-size ceiling every `jsonb` write enforces, so a test can
     /// pin the boundary the guard below enforces rather than restating the
@@ -424,6 +424,16 @@ pub mod __test_support {
         sweeper.with_pass_deadline(deadline)
     }
 
+    /// Runs only a worker's sweep loop with a test-owned drain budget, so tests
+    /// can exercise the pass limit without racing the shipped wall-clock limit.
+    pub async fn run_worker_sweeper(
+        worker: Worker,
+        shutdown: tokio_util::sync::CancellationToken,
+        max_drain_time: Duration,
+    ) {
+        crate::worker::run_sweep_loop_for_test(worker, shutdown, max_drain_time).await;
+    }
+
     /// Raw dequeue that does not require a worker lease.
     pub async fn dequeue(queue: &Queue, limit: i64, worker_id: Uuid) -> Result<Vec<JobRow>, Error> {
         queue.database().dequeue_unleased(limit, worker_id).await
@@ -491,16 +501,7 @@ pub mod __test_support {
             .iter()
             .map(|(id, attempts)| crate::database::DatabaseUnacknowledgedClaim { id: *id, attempts: *attempts })
             .collect();
-        Ok(crate::database::requeue_unacknowledged_claims(
-            database.pool(),
-            database.name(),
-            database.notify_channel(),
-            database.done_channel(),
-            worker_id,
-            database.claim_resolution_lock_key(),
-            &mut claims,
-        )
-        .await?)
+        Ok(database.requeue_unacknowledged_claims(worker_id, &mut claims).await?)
     }
 
     /// Arms the dequeue commit guard for the given claims and drops it without

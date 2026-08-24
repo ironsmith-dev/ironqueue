@@ -16,8 +16,8 @@ use crate::{
 };
 use ironqueue::Sweeper;
 use ironqueue::{
-    Error, JobContext, JobError, JobErrorKind, JobRequest, JobRetention, JobState, JobStatus, MigrationMode, Queue,
-    Worker, WorkerBuilder, WorkerComponent, WorkerHealthStatus, WorkerTimers,
+    Error, JobContext, JobError, JobErrorKind, JobRequest, JobRetention, JobState, JobStatus, Queue, Worker,
+    WorkerBuilder, WorkerComponent, WorkerHealthStatus, WorkerTimers,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -2512,14 +2512,12 @@ async fn test_max_burst_jobs_caps_processing_even_under_concurrency(pool: PgPool
     assert_eq!(db.queue.counts().await.unwrap().queued, 8, "remaining jobs left untouched");
 }
 
-/// One sweep tick drains far more than four full batches. The tick interval is
-/// a minute, so nothing below can be finished by a *second* tick — but the
-/// drain inside that tick is also bounded by `MAX_SWEEP_DRAIN_TIME` (one
-/// second), and every other loop in this worker competes for the same pool
-/// while it runs. None of them has anything to do here, so they are slowed to a
-/// minute and the drain gets the pool to itself. The poll window is generous
-/// for the same reason and gives nothing away: with a sixty second tick, a
-/// drain observed at any point inside the window is still that first tick's.
+/// One sweep tick drains far more than four full batches. The production loop
+/// also has a one-second wall-clock budget, which can expire after a single
+/// pass when the test runner is starved by another test's compilation. This
+/// test gives the same loop a test-owned time budget so the pass limit is the
+/// only subject. The tick interval is a minute, so nothing below can be
+/// finished by a second tick.
 #[sqlx::test(migrations = "./migrations")]
 async fn test_sweep_loop_drains_more_than_four_full_batches_per_tick(pool: PgPool) {
     let db = TestDb::with(pool.clone(), |builder| builder.sweep_batch_size(1)).await;
@@ -2541,12 +2539,12 @@ async fn test_sweep_loop_drains_more_than_four_full_batches_per_tick(pool: PgPoo
     let quiet = Duration::from_secs(60);
     let worker = test_worker(db.queue.clone())
         .register_job(always_fails)
-        .poll_interval(quiet)
         .timers(WorkerTimers { sweep: quiet, abort: quiet, schedule: quiet, worker_info: quiet })
         .build()
         .unwrap();
     let shutdown = CancellationToken::new();
-    let run = tokio::spawn(worker.run_until(shutdown.clone()));
+    let run =
+        tokio::spawn(ironqueue::__test_support::run_worker_sweeper(worker, shutdown.clone(), Duration::from_secs(60)));
 
     wait_until(
         Duration::from_secs(20),
@@ -2566,7 +2564,7 @@ async fn test_sweep_loop_drains_more_than_four_full_batches_per_tick(pool: PgPoo
     .await;
 
     shutdown.cancel();
-    run.await.unwrap().unwrap();
+    run.await.unwrap();
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -3278,7 +3276,7 @@ async fn test_worker_processes_jobs_by_polling_when_the_listener_cannot_connect(
         sqlx::postgres::PgPoolOptions::new().min_connections(4).max_connections(4).connect(&client_url).await.unwrap();
     crate::warm_pool(&pool, 4).await;
     crate::revoke_connect(&url, &client_url).await;
-    let queue = Queue::builder(&client_url).pool(pool).migration_mode(MigrationMode::Skip).connect().await.unwrap();
+    let queue = Queue::builder(&client_url).pool(pool).connect().await.unwrap();
     let id = queue.enqueue(listenerless::job(())).await.unwrap().job_id();
 
     let shutdown = CancellationToken::new();
@@ -3480,7 +3478,7 @@ async fn queue_without_a_listener(tag: &str) -> (String, String, Queue) {
         sqlx::postgres::PgPoolOptions::new().min_connections(4).max_connections(4).connect(&client_url).await.unwrap();
     crate::warm_pool(&pool, 4).await;
     crate::revoke_connect(&url, &client_url).await;
-    let queue = Queue::builder(&client_url).pool(pool).migration_mode(MigrationMode::Skip).connect().await.unwrap();
+    let queue = Queue::builder(&client_url).pool(pool).connect().await.unwrap();
     (url, client_url, queue)
 }
 
@@ -3639,13 +3637,7 @@ async fn test_sweep_leadership_fails_over_when_the_leader_cannot_sweep() {
         .connect(&client_url)
         .await
         .unwrap();
-    let queue_a = Queue::builder(&client_url)
-        .pool(pool_a)
-        .sweep_grace(crate::MIN_SWEEP_GRACE)
-        .migration_mode(MigrationMode::Skip)
-        .connect()
-        .await
-        .unwrap();
+    let queue_a = Queue::builder(&client_url).pool(pool_a).sweep_grace(crate::MIN_SWEEP_GRACE).connect().await.unwrap();
 
     let shutdown_a = CancellationToken::new();
     let worker_a = Worker::builder(queue_a.clone())
@@ -4677,7 +4669,11 @@ async fn repro_nul_error(_: ()) -> anyhow::Result<()> {
 
 #[sqlx::test(migrations = "./migrations")]
 async fn test_worker_finalizes_an_attempt_whose_result_or_error_carries_a_nul(pool: PgPool) {
-    let db = TestDb::new(pool.clone()).await;
+    // Finalization and slot release are the subjects here, not stuck-job
+    // recovery. Prevent trybuild compilation from starving this current-thread
+    // runtime long enough for the test fixture's 1ms sweep grace to abort a
+    // live attempt.
+    let db = TestDb::with(pool.clone(), |builder| builder.sweep_grace(Duration::from_secs(60))).await;
     let result_id = db.queue.enqueue(repro_nul_result::job(())).await.unwrap().job_id();
     let error_id = db.queue.enqueue(repro_nul_error::job(())).await.unwrap().job_id();
 
@@ -4725,7 +4721,9 @@ async fn repro_nul_job_error(_: ()) -> Result<(), JobError> {
 
 #[sqlx::test(migrations = "./migrations")]
 async fn test_worker_finalizes_a_handler_built_job_error_whose_message_carries_a_nul(pool: PgPool) {
-    let db = TestDb::new(pool.clone()).await;
+    // See the sibling NUL finalization test: the sweeper is deliberately kept
+    // out of this finalization and processor-slot assertion.
+    let db = TestDb::with(pool.clone(), |builder| builder.sweep_grace(Duration::from_secs(60))).await;
     let wedge_id = db.queue.enqueue(repro_nul_job_error::job(())).await.unwrap().job_id();
     let next_id = db.queue.enqueue(repro_noop::job(())).await.unwrap().job_id();
 
@@ -4781,7 +4779,9 @@ async fn repro_deep_result(_: ()) -> anyhow::Result<Value> {
 
 #[sqlx::test(migrations = "./migrations")]
 async fn test_worker_fails_an_attempt_whose_result_nests_deeper_than_it_can_be_read_back(pool: PgPool) {
-    let db = TestDb::new(pool.clone()).await;
+    // This is the same finalization path and needs the same sweep isolation as
+    // the two NUL cases above.
+    let db = TestDb::with(pool.clone(), |builder| builder.sweep_grace(Duration::from_secs(60))).await;
     let deep_id = db.queue.enqueue(repro_deep_result::job(())).await.unwrap().job_id();
     let next_id = db.queue.enqueue(repro_noop::job(())).await.unwrap().job_id();
 
