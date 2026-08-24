@@ -1580,12 +1580,14 @@ async fn test_dashboard_surfaces_worker_and_job_data_for_multiple_queues(pool: P
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn test_dashboard_deduplicates_repeated_queue_handles(pool: PgPool) {
+async fn test_dashboard_rejects_repeated_queue_names(pool: PgPool) {
     let first = TestDb::new(pool.clone()).await;
     let second = TestDb::new(pool.clone()).await;
-    let router = dashboard([first.queue.clone(), second.queue.clone()]).router().unwrap();
-    let (_, body) = get_json(&router, "/api/queues").await;
-    assert_eq!(body["queues"].as_array().unwrap().len(), 1);
+    match dashboard([first.queue.clone(), second.queue.clone()]).router() {
+        Err(Error::Config(message)) => assert!(message.contains("configured more than once"), "{message}"),
+        Err(error) => panic!("unexpected error: {error}"),
+        Ok(_) => panic!("duplicate queue names must not leave one database outside /health"),
+    }
 }
 
 #[sqlx::test(migrations = "./migrations")]

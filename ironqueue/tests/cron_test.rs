@@ -2068,8 +2068,9 @@ const CRON_SCHEDULE_CLAIM: &str = "%FROM ironqueue.cron_schedules%FOR UPDATE SKI
 
 /// `FOR UPDATE SKIP LOCKED` is what keeps two workers from both publishing the
 /// same occurrence: the loser skips the row entirely and must leave the cursor
-/// alone, so the occurrence is published by the winner and not lost. Nothing
-/// covered the loser's side.
+/// alone, so the occurrence is published by the winner and not lost. A short
+/// collision is healthy, but one that persists must degrade scheduler health
+/// until the row becomes available again.
 #[sqlx::test(migrations = "./migrations")]
 async fn test_cron_publishes_nothing_while_another_transaction_holds_the_schedule(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
@@ -2084,6 +2085,7 @@ async fn test_cron_publishes_nothing_while_another_transaction_holds_the_schedul
         .poll_interval(Duration::from_millis(20))
         .build()
         .unwrap();
+    let health = worker.health();
     let shutdown = CancellationToken::new();
     let run = tokio::spawn(worker.run_until(shutdown.clone()));
 
@@ -2139,7 +2141,7 @@ async fn test_cron_publishes_nothing_while_another_transaction_holds_the_schedul
             let attempts = stats.since_now(CRON_SCHEDULE_CLAIM).await;
             stats.wait_for_calls(&attempts, 3, "the scheduler never reached the locked schedule").await;
         }
-        None => tokio::time::sleep(Duration::from_secs(2)).await,
+        None => tokio::time::sleep(Duration::from_secs(4)).await,
     }
     assert_eq!(
         cron_job_count(&pool, db.queue.name(), key).await,
@@ -2151,6 +2153,17 @@ async fn test_cron_publishes_nothing_while_another_transaction_holds_the_schedul
         held,
         "and it must leave the cursor for the holder, not advance past it"
     );
+    wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+        "persistent cron-row contention did not degrade scheduler health",
+        || async {
+            health.snapshot().failures.iter().any(|failure| {
+                failure.component == WorkerComponent::Scheduler && failure.message.contains("remained locked")
+            })
+        },
+    )
+    .await;
 
     holder.rollback().await.unwrap();
     wait_until(
@@ -2158,6 +2171,13 @@ async fn test_cron_publishes_nothing_while_another_transaction_holds_the_schedul
         Duration::from_millis(10),
         "scheduling did not resume once the schedule row was released",
         || async { cron_job_count(&pool, db.queue.name(), key).await > published },
+    )
+    .await;
+    wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+        "scheduler health did not recover after the cron row was released",
+        || async { !health.snapshot().failures.iter().any(|failure| failure.component == WorkerComponent::Scheduler) },
     )
     .await;
 

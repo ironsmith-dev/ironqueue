@@ -328,6 +328,58 @@ mod enqueue_and_wait {
         assert!(matches!(err, Error::ResultExpired(id) if id == handle.id()), "{err}");
     }
 
+    /// The completion event is the only durable-in-memory record of *which*
+    /// terminal state retention is about to erase. A failed immediate re-fetch
+    /// must not discard it: after the row is swept, polling alone can report
+    /// only a generic expired result.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn test_wait_preserves_a_failed_event_across_a_read_timeout_and_retention_sweep(pool: PgPool) {
+        let query_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(100))
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        let db = TestDb::new(query_pool.clone()).await;
+        let control = TestDb::new(pool.clone()).await;
+        let Some(mut stats) = crate::Stats::new(&db.database).await else {
+            return crate::Stats::skipped(
+                "test_wait_preserves_a_failed_event_across_a_read_timeout_and_retention_sweep",
+            );
+        };
+        let fetches = stats.since_now("%FROM ironqueue.jobs WHERE id = $1 AND queue = $2%").await;
+
+        let handle = db
+            .queue
+            .enqueue(fails_if_odd::job(3).retention(JobRetention::For(Duration::from_millis(1))))
+            .await
+            .unwrap()
+            .unwrap();
+        let waiter = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.wait(Some(Duration::from_secs(10))).await })
+        };
+        wait_for_done_listener(&db).await;
+        stats.wait_for_calls(&fetches, 1, "waiter never read the live job").await;
+
+        // Occupy the waiter's entire query pool only after its first successful
+        // read. The independent LISTEN connection still receives the finish,
+        // but the event-triggered re-fetch reaches its 100 ms acquire timeout.
+        let held = query_pool.acquire().await.unwrap();
+        let active = control.queue.dequeue(1, uuid::Uuid::now_v7()).await.unwrap().remove(0);
+        assert!(control.queue.finish(&active, JobStatus::Failed, None, Some("odd number 3")).await.unwrap());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!waiter.is_finished(), "the wait ended while its query pool was unavailable");
+
+        let mut sweeper = control.queue.sweeper();
+        let report = sweeper.sweep().await.unwrap();
+        assert_eq!(report.purged_jobs, 1, "the terminal row was not removed by retention");
+        drop(held);
+
+        let error = waiter.await.unwrap().unwrap_err();
+        assert!(matches!(error, Error::Job(ref job) if job.kind == JobErrorKind::Failed), "{error}");
+    }
+
     //noinspection SqlNoDataSourceInspection
     #[sqlx::test(migrations = "./migrations")]
     async fn test_foreign_notifications_do_not_postpone_fallback_polling(pool: PgPool) {

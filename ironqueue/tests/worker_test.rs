@@ -118,9 +118,24 @@ async fn observes_shutdown_cancellation(
 }
 
 /// Reacts to shutdown the way [`JobContext::cancellation`] documents, reporting
-/// the unfinished attempt as an error.
+/// the unfinished attempt as explicitly aborted.
 #[ironqueue::job(max_attempts = 1, timeout_ms = 30_000)]
 async fn errs_on_shutdown_cancellation(
+    _: (),
+    probe: JobState<CancellationObservedProbe>,
+    ctx: JobContext,
+) -> Result<(), JobError> {
+    probe.0.started.notify_one();
+    ctx.cancellation().cancelled().await;
+    probe.0.observed.notify_one();
+    Err(JobError::new(JobErrorKind::Aborted, "stopped for shutdown"))
+}
+
+/// Produces a genuine handler failure after shutdown has begun. Waiting for the
+/// token makes the overlap deterministic; the error is deliberately not an
+/// `Aborted` classification, so shutdown must not rewrite its meaning.
+#[ironqueue::job(max_attempts = 1, timeout_ms = 30_000)]
+async fn fails_during_shutdown(
     _: (),
     probe: JobState<CancellationObservedProbe>,
     ctx: JobContext,
@@ -128,7 +143,7 @@ async fn errs_on_shutdown_cancellation(
     probe.0.started.notify_one();
     ctx.cancellation().cancelled().await;
     probe.0.observed.notify_one();
-    anyhow::bail!("stopped for shutdown")
+    anyhow::bail!("cleanup failed")
 }
 
 #[derive(Clone)]
@@ -669,8 +684,41 @@ async fn test_shutdown_requeues_a_handler_that_reports_cancellation_as_an_error(
     assert_eq!(row.status, JobStatus::Queued);
     assert_eq!(row.attempts, 1);
     assert_eq!(row.max_attempts, 2);
-    assert_eq!(row.error.as_deref(), Some("failed: stopped for shutdown"));
+    assert_eq!(row.error.as_deref(), Some("aborted: stopped for shutdown"));
     assert_eq!(db.queue.stats().failed, 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn test_shutdown_records_a_handler_failure_that_is_not_classified_as_aborted(pool: PgPool) {
+    let db = TestDb::new(pool.clone()).await;
+    let handle = db.queue.enqueue(fails_during_shutdown::job(())).await.unwrap().unwrap();
+    let probe = CancellationObservedProbe {
+        started: Arc::new(tokio::sync::Notify::new()),
+        observed: Arc::new(tokio::sync::Notify::new()),
+    };
+    let worker = test_worker(db.queue.clone())
+        .register_job(fails_during_shutdown)
+        .state(probe.clone())
+        .shutdown_grace(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let shutdown = CancellationToken::new();
+    let run = tokio::spawn(worker.run_until(shutdown.clone()));
+
+    tokio::time::timeout(Duration::from_secs(5), probe.started.notified()).await.expect("handler did not start");
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(2), probe.observed.notified())
+        .await
+        .expect("handler did not observe cancellation at shutdown start");
+    run.await.unwrap().unwrap();
+
+    let row = handle.fetch_job().await.unwrap();
+    assert_eq!(row.status, JobStatus::Failed);
+    assert_eq!(row.attempts, 1);
+    assert_eq!(row.max_attempts, 1, "a genuine failure must not receive a shutdown refund");
+    assert_eq!(row.error.as_deref(), Some("failed: cleanup failed"));
+    assert_eq!(db.queue.stats().failed, 1);
+    assert_eq!(db.queue.stats().retried, 0);
 }
 
 #[sqlx::test(migrations = "./migrations")]

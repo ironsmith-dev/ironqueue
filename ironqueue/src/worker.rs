@@ -54,6 +54,10 @@ const MAX_SWEEP_DRAIN_PASSES: usize = 256;
 /// them means retention is not keeping up with the queue, which is otherwise
 /// visible only as a table that keeps growing.
 const MAX_SWEEP_BEHIND_TICKS: u32 = 3;
+/// Consecutive scheduling passes that may skip the same locked cron row before
+/// scheduler health degrades. One or two are ordinary peer contention; a run
+/// means the cron is making no progress and a warning alone is insufficient.
+const MAX_CRON_CONTENDED_TICKS: u32 = 3;
 const DEQUEUE_RETRY_INITIAL_MAX_MS: u64 = 3;
 const DEQUEUE_RETRY_MAX_MS: u64 = 100;
 /// The most processors one worker may be configured to run. See the check in
@@ -772,6 +776,11 @@ impl WorkerBuilder {
     /// than `attempts` lowered, so the pair a job displays drifts upward across
     /// restarts that catch it mid-flight (see
     /// [`JobRow::max_attempts`](crate::JobRow)). Default 30s.
+    ///
+    /// A handler that stops cooperatively may return a [`JobError`] classified
+    /// as [`JobErrorKind::Aborted`] to requeue the unfinished attempt with the
+    /// same refund. Every other returned error is recorded as the handler's
+    /// outcome, even when it happens during this grace period.
     ///
     /// It also bounds shutdown's first durable act — closing this worker's
     /// lease to new work — except that this one step is never given less than
@@ -2637,13 +2646,17 @@ async fn try_finalize(
             .await
         }
         WorkerAttemptResult::Errored(error) => {
-            // Shutdown cancels every handler's cooperative token at the start
-            // of the grace window, and the documented reaction is to return
-            // after bounded cleanup. That return is a shutdown, not a failed
-            // attempt: spend no attempt on it and let another worker run the
-            // job, exactly as a handler force-stopped at grace expiry does.
-            // The handler's message is kept so the reason stays visible.
-            if cooperative_shutdown.is_cancelled() && abort_reason.get().is_none() {
+            // The global token says only that shutdown overlapped the outcome,
+            // not that it caused it: a handler error, panic, timeout, or decode
+            // failure can settle just before or during the same grace window.
+            // Refund only an explicitly aborted handler outcome. That kind is
+            // the handler's provenance that it stopped for cancellation; every
+            // other kind remains a genuine attempt result. A user abort still
+            // wins through `abort_reason` and the guarded database transition.
+            if error.kind == JobErrorKind::Aborted
+                && cooperative_shutdown.is_cancelled()
+                && abort_reason.get().is_none()
+            {
                 let stored_error = error.to_string();
                 return match database.requeue_shutdown(job, &stored_error).await {
                     Ok(true) => Ok(WorkerProcessResult::Requeued),
@@ -3059,12 +3072,29 @@ struct CronSchedulingState {
     /// Reconciliation failures that a later attempt may clear. Discarded and
     /// re-collected whenever those crons are retried.
     rejected: Vec<String>,
+    /// Consecutive passes in which each due schedule row was locked. Entries
+    /// disappear after a pass processes the row or finds that it is no longer due.
+    contended: HashMap<String, u32>,
 }
 
 impl CronSchedulingState {
     /// Every reconciliation failure still in force, permanent ones first.
     fn failures(&self) -> Vec<String> {
-        self.disabled_reasons.iter().chain(&self.rejected).cloned().collect()
+        let mut failures: Vec<String> = self.disabled_reasons.iter().chain(&self.rejected).cloned().collect();
+        let mut contended: Vec<String> = self
+            .contended
+            .iter()
+            .filter(|(_, ticks)| **ticks >= MAX_CRON_CONTENDED_TICKS)
+            .map(|(key, _)| {
+                format!(
+                    "{key}: cron schedule row remained locked for at least \
+                     {MAX_CRON_CONTENDED_TICKS} consecutive passes"
+                )
+            })
+            .collect();
+        contended.sort();
+        failures.extend(contended);
+        failures
     }
 }
 
@@ -3175,7 +3205,7 @@ async fn schedule_crons_once(
         let retry_keys = state.unreconciled.clone();
         reconcile_crons_into(inner, state, Some(&retry_keys)).await;
     }
-    let mut failed = state.failures();
+    let mut pass_failures = Vec::new();
     let candidates: Vec<String> = inner
         .crons
         .iter()
@@ -3198,12 +3228,17 @@ async fn schedule_crons_once(
             }
         }
     };
+    state.contended.retain(|key, _| due.contains(key));
     let mut advance_again = false;
     for entry in &inner.crons {
         if !due.contains(&entry.dedupe_key) {
             continue;
         }
-        match inner.database.schedule_cron(entry, through).await {
+        let scheduled = inner.database.schedule_cron(entry, through).await;
+        if !matches!(&scheduled, Ok(DatabaseCronScheduleResult::Contended)) {
+            state.contended.remove(&entry.dedupe_key);
+        }
+        match scheduled {
             Ok(DatabaseCronScheduleResult::NotDue) => {}
             // Another transaction holds the schedule row. Ordinarily that is a
             // peer's publication and gone within a round trip, which is why the
@@ -3211,10 +3246,12 @@ async fn schedule_crons_once(
             // (an operator's `SELECT ... FOR UPDATE`, a session left open in a
             // transaction) holds it indefinitely, and this arm was silent: no
             // log, no health change, the cursor frozen and the cron simply not
-            // firing for as long as it lasted. Rate-limited by the same set the
-            // held-key warning uses, so a busy schedule cannot flood the log.
+            // firing for as long as it lasted. Warn on the first pass in each
+            // consecutive run, then let health carry a persistent one.
             Ok(DatabaseCronScheduleResult::Contended) => {
-                if holder_warned.insert(entry.dedupe_key.clone()) {
+                let ticks = state.contended.entry(entry.dedupe_key.clone()).or_default();
+                *ticks = ticks.saturating_add(1);
+                if *ticks == 1 {
                     tracing::warn!(
                         cron = %entry.template.name,
                         dedupe_key = %entry.dedupe_key,
@@ -3297,11 +3334,9 @@ async fn schedule_crons_once(
                     authority.revision = revision,
                     "cron definition conflicts with the stored schedule; not scheduled by this worker"
                 );
-                // Both, so the degradation takes effect on *this* pass:
-                // `failed` was taken from `state` before the loop, and
-                // `disabled_reasons` is what keeps it degraded on every pass
-                // after, since a disabled cron is never re-evaluated.
-                failed.push(reason.clone());
+                // The reason is read after the loop, so degradation takes
+                // effect on this pass and persists: a disabled cron is never
+                // re-evaluated.
                 state.disabled_reasons.push(reason);
             }
             // Queued for reconciliation, exactly like a transient
@@ -3315,10 +3350,12 @@ async fn schedule_crons_once(
             Err(error) => {
                 tracing::warn!(%error, cron = %entry.template.name, "cron scheduling failed");
                 state.unreconciled.insert(entry.dedupe_key.clone());
-                failed.push(format!("{}: {error}", entry.template.name));
+                pass_failures.push(format!("{}: {error}", entry.template.name));
             }
         }
     }
+    let mut failed = state.failures();
+    failed.extend(pass_failures);
     if failed.is_empty() {
         inner.health.recovered(WorkerComponent::Scheduler);
     } else {

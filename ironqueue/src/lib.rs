@@ -118,10 +118,10 @@ pub use worker::{
 };
 
 /// Marks an `async fn` as a cron job handler run on a schedule. The first
-/// attribute argument is a UTC cron expression whose syntax is checked at
-/// compile time; an expression with no future occurrence disables that cron on
-/// the worker and degrades [`WorkerComponent::Scheduler`] health rather than
-/// stopping the worker.
+/// attribute argument is a UTC cron expression. Its syntax and whether it can
+/// ever produce an occurrence are checked at compile time; a never-firing
+/// expression is a compile error.
+///
 /// Cron functions take no payload — every parameter is an extractor.
 ///
 /// Occurrences of one schedule never overlap and never queue behind each

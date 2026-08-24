@@ -513,8 +513,9 @@ impl Dashboard {
     }
 
     /// Builds the axum router: serve it standalone or `.nest(...)` it into an
-    /// existing application. Duplicate queue names are shown once because names
-    /// are the dashboard's URL identifiers.
+    /// existing application. Queue names are the dashboard's URL identifiers,
+    /// so duplicate names are rejected rather than leaving one queue unrouted
+    /// and unprobed by `/health`.
     ///
     /// At least one queue is required: `/health` probes the configured queues,
     /// so with none it would report ready without ever reaching a database.
@@ -594,22 +595,13 @@ impl Dashboard {
                  middleware or keep it on a trusted network"
             );
         }
-        // Routes are keyed by queue name, so a second handle under a name
-        // already taken can never be reached. That is harmless when it is the
-        // same queue twice and a silent hole when it is not: two handles named
-        // `default` against *different* databases leaves the second one
-        // unrouted and unprobed by `/health`, which then reports green for a
-        // database it has never queried. Dropping it is still the only routable
-        // choice; saying so is not.
         let mut queues: Vec<Queue> = Vec::new();
         for queue in self.queues {
             if queues.iter().any(|existing| existing.name() == queue.name()) {
-                tracing::warn!(
-                    queue = %queue.name(),
-                    "dashboard was given more than one queue named this; only the first is \
-                     routed to, and the rest are not probed by /health"
-                );
-                continue;
+                return Err(Error::Config(format!(
+                    "dashboard queue name {:?} is configured more than once",
+                    queue.name()
+                )));
             }
             queues.push(queue);
         }

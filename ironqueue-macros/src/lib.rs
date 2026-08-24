@@ -7,7 +7,7 @@ use proc_macro::TokenStream;
 mod attrs;
 mod expand;
 
-/// Marks an `async fn` as a ironqueue job handler.
+/// Marks an `async fn` as an ironqueue job handler.
 ///
 /// The accepted attributes and the signature contract are documented on the
 /// re-export this is used through, `ironqueue::job`.
@@ -16,13 +16,12 @@ pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
     expand::expand_job(attr.into(), item.into()).unwrap_or_else(syn::Error::into_compile_error).into()
 }
 
-/// Marks an `async fn` as a ironqueue cron job, run on the given schedule.
+/// Marks an `async fn` as an ironqueue cron job, run on the given schedule.
 ///
-/// The first argument is the cron expression (syntax-checked at compile time);
-/// the rest are the same configuration attributes as `job`. A syntactically
-/// valid expression with no future UTC occurrence disables that cron on the
-/// worker and degrades its scheduler health rather than stopping it. Cron
-/// functions take no payload — every parameter is an extractor.
+/// The first argument is the cron expression; its syntax and whether it can
+/// ever produce a UTC occurrence are checked at compile time. The rest are the
+/// same configuration attributes as `job`. Cron functions take no payload —
+/// every parameter is an extractor.
 ///
 /// The accepted attributes are documented on the re-export this is used
 /// through, `ironqueue::cron`.

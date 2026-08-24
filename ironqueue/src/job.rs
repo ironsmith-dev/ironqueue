@@ -661,11 +661,11 @@ impl From<&JobRow> for JobCursor {
 /// The two differ in both halves of that argument. There is no safe substitute
 /// for a status: it is the row's identity, `is_terminal` and every dashboard
 /// action key off it, and answering `queued` for a state this build has never
-/// heard of tells an operator to expect a run that will not happen. And the
-/// damage a strict decode does there does not arise here: the backoff's is that
-/// a batch decode refusal rolls the claim back and the next dequeue re-selects
-/// the same rows, so one unreadable value blocks every job queued behind it,
-/// claim after claim. The `status` a claim returns is the literal `'running'`
+/// heard of tells an operator to expect a run that will not happen. That
+/// failure mode does not apply to status. A backoff decode refusal rolls the
+/// claim back and the next dequeue re-selects the same rows, so one unreadable
+/// value blocks every job queued behind it, claim after claim. The `status` a
+/// claim returns is the literal `'running'`
 /// its own statement just wrote, so a batch can never carry an unreadable
 /// one. Most readers that can meet one — `Queue::jobs_page`, `Queue::fetch_job`,
 /// the dashboard listing — are read-only, so a new value costs an old binary a
@@ -965,6 +965,11 @@ impl JobContext {
     /// Shutdown allows up to the worker's configured `shutdown_grace`; a user
     /// abort allows up to
     /// [`WorkerBuilder::abort_grace`](crate::WorkerBuilder::abort_grace).
+    /// A handler that returns early for cooperative cancellation should return
+    /// a [`JobError`] with [`JobErrorKind::Aborted`]. During worker shutdown,
+    /// that explicit classification puts the unfinished attempt back on its
+    /// queue and refunds the attempt. Other errors are recorded normally even
+    /// if shutdown happens at the same time.
     /// The task is forcibly stopped when that bound expires. Attempt timeouts,
     /// sweeper recovery, and a job row deleted under a running attempt stop the
     /// task immediately, so this token is a cooperative cleanup opportunity
@@ -2624,6 +2629,12 @@ impl<J: JobType> JobHandle<J> {
         // normal state under many concurrent waiters — turned a finished job
         // into a missing one.
         let mut seen_alive = false;
+        // A terminal notification carries the one fact polling cannot recover
+        // after retention deletes the row: whether the job failed or was
+        // aborted. Keep it across a failed re-fetch instead of consuming that
+        // fact along with the event. A later successful non-terminal read
+        // disproves a stale or foreign notification and clears it.
+        let mut pending_terminal_event = None;
         'poll: loop {
             // A poll that could not reach the database is a *lost poll*, not a
             // lost wait. Propagating it ended every in-flight wait on the first
@@ -2658,6 +2669,7 @@ impl<J: JobType> JobHandle<J> {
             let missing = match outcome {
                 Some(outcome) if outcome.status.is_terminal() => return resolve(outcome),
                 Some(_) => {
+                    pending_terminal_event = None;
                     seen_alive = true;
                     false
                 }
@@ -2665,7 +2677,10 @@ impl<J: JobType> JobHandle<J> {
                 // NOTIFY atomically, but listener delivery can lag this read.
                 // Give the already-subscribed receiver one poll interval to
                 // observe that terminal event before declaring the ID absent.
-                None => true,
+                None => match pending_terminal_event.take() {
+                    Some(event) => return resolve_deleted(event),
+                    None => true,
+                },
             };
             let poll_deadline = tokio::time::sleep(poll_interval);
             poll_interval = (poll_interval * 2).min(MAX_POLL_INTERVAL);
@@ -2675,7 +2690,10 @@ impl<J: JobType> JobHandle<J> {
                     biased;
                     _ = &mut poll_deadline => {
                         if missing {
-                            return Err(self.vanished(seen_alive));
+                            return match pending_terminal_event.take() {
+                                Some(event) => resolve_deleted(event),
+                                None => Err(self.vanished(seen_alive)),
+                            };
                         }
                         continue 'poll;
                     },
@@ -2691,12 +2709,16 @@ impl<J: JobType> JobHandle<J> {
                                 Ok(None) => return resolve_deleted(event),
                                 // The same rule as the poll above: a read that
                                 // failed learned nothing, least of all that the
-                                // row is gone. Keep waiting; the poll below is
-                                // the fallback this notification only shortcuts.
-                                Err(error) => tracing::warn!(
-                                    job.id = %self.id, %error,
-                                    "job completion read failed; falling back to polling"
-                                ),
+                                // row is gone. Keep the event while polling so
+                                // a later missing row retains its terminal
+                                // classification after retention deletes it.
+                                Err(error) => {
+                                    pending_terminal_event = Some(event);
+                                    tracing::warn!(
+                                        job.id = %self.id, %error,
+                                        "job completion read failed; falling back to polling"
+                                    );
+                                }
                             }
                         }
                         // Only reachable if the listener task is gone; the
@@ -2704,7 +2726,10 @@ impl<J: JobType> JobHandle<J> {
                         None => {
                             poll_deadline.as_mut().await;
                             if missing {
-                                return Err(self.vanished(seen_alive));
+                                return match pending_terminal_event.take() {
+                                    Some(event) => resolve_deleted(event),
+                                    None => Err(self.vanished(seen_alive)),
+                                };
                             }
                             continue 'poll;
                         }
