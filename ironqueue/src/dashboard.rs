@@ -68,12 +68,10 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
-use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use axum::extract::{ConnectInfo, Form, Path, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Form, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -386,6 +384,10 @@ impl Dashboard {
     /// carrying one makes the encoded credential ambiguous — `("ops:admin",
     /// "s3cret")` would be satisfied by the password `admin:s3cret` under the
     /// username `ops` as well. Refused with [`Error::Config`].
+    ///
+    /// Each value may contain at most 512 bytes. This keeps every accepted credential small enough for the dashboard's
+    /// login and password-change request limits, including the extra bytes added by form and JSON encoding. Refused
+    /// with [`Error::Config`].
     pub fn basic_auth(mut self, user: impl Into<String>, password: impl Into<String>) -> Self {
         self.auth = DashboardAuthentication::Basic { username: user.into(), password: password.into() };
         self
@@ -483,10 +485,10 @@ impl Dashboard {
     /// # Put it behind a reverse proxy on an untrusted network
     ///
     /// The standalone server defaults to a 10-second header deadline, a
-    /// 30-second request deadline, 256 accepted connections, and 128 executing
-    /// requests. [`DashboardServer`] exposes setters for each limit. None of them cuts off a client the moment it
-    /// stops reading its response: such a client keeps its connection, and the slot the connection cap counts it
-    /// against, until a write to it has made no progress for the whole request deadline.
+    /// 30-second request and connection deadline, 256 accepted connections, and 128 executing requests.
+    /// [`DashboardServer`] exposes setters for each limit. Once the application has prepared the first response on a
+    /// connection, its absolute connection deadline does not restart when the client makes progress reading responses.
+    /// Connections that never finish their first header are bounded by the header deadline instead.
     ///
     /// A reverse proxy that terminates slow clients — any of nginx, HAProxy, Envoy or an ALB in a default
     /// configuration — is what removes that, and it is still the normal place to terminate TLS and what
@@ -567,6 +569,11 @@ impl Dashboard {
         // rather than silently widen the accepted set.
         if username.contains(':') {
             return Err(Error::Config("dashboard basic_auth username must not contain ':'".into()));
+        }
+        if username.len() > MAX_CREDENTIAL_BYTES || password.len() > MAX_CREDENTIAL_BYTES {
+            return Err(Error::Config(format!(
+                "dashboard basic_auth username and password must each be at most {MAX_CREDENTIAL_BYTES} bytes"
+            )));
         }
         // The same floor `change_password` enforces, as a warning rather than a
         // refusal: the configured credential often arrives from an environment
@@ -690,10 +697,9 @@ impl DashboardServer {
     }
 
     /// Sets the deadline for one parsed request, including its body and any wait
-    /// for a request slot. Default 30 seconds. It doubles as the write-stall deadline: a client that stops reading
-    /// its response loses the connection once a write to it has made no progress for this long, because hyper has no
-    /// write-side deadline of its own and the connection would otherwise hold its slot for as long as the client
-    /// likes.
+    /// for a request slot. Default 30 seconds. It also sets the absolute lifetime of each connection starting when the
+    /// application has prepared its first response, so a slow response reader cannot keep a connection slot by making
+    /// occasional progress. Later keep-alive requests share the connection's remaining lifetime.
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.limits.request_timeout = timeout;
         self
@@ -1050,103 +1056,35 @@ async fn serve_dashboard_connection(
     limits: DashboardServerLimits,
     shutdown: CancellationToken,
 ) -> Result<(), hyper::Error> {
+    let first_response = CancellationToken::new();
+    let response_ready = first_response.clone();
     let service = hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
         let router = router.clone();
+        let response_ready = response_ready.clone();
         async move {
             let mut request = request.map(axum::body::Body::new);
             request.extensions_mut().insert(ConnectInfo(peer));
-            router.oneshot(request).await
+            let response = router.oneshot(request).await;
+            response_ready.cancel();
+            response
         }
     });
     let mut builder = hyper::server::conn::http1::Builder::new();
     builder.timer(hyper_util::rt::TokioTimer::new()).header_read_timeout(limits.header_read_timeout);
-    let stream = WriteStallTimeout::new(stream, limits.request_timeout);
     let connection = builder.serve_connection(hyper_util::rt::TokioIo::new(stream), service);
     tokio::pin!(connection);
+    let connection_deadline = async move {
+        first_response.cancelled().await;
+        tokio::time::sleep(limits.request_timeout).await;
+    };
+    tokio::pin!(connection_deadline);
     tokio::select! {
         result = connection.as_mut() => result,
+        _ = &mut connection_deadline => Ok(()),
         _ = shutdown.cancelled() => {
             connection.as_mut().graceful_shutdown();
             connection.await
         }
-    }
-}
-
-/// A stream that fails once a write to it has made no progress for `timeout`.
-///
-/// hyper has no write-side deadline, and writing to a peer that has stopped reading is `Pending` for as long as the
-/// peer likes, so the header and request deadlines leave a connection stalled mid-response with nothing to end it.
-/// The connection permit it holds was taken before the accept that produced it, so enough of them stop the dashboard
-/// accepting anything at all — including `/health`, which an orchestrator restarts a healthy worker over.
-struct WriteStallTimeout {
-    stream: tokio::net::TcpStream,
-    timeout: Duration,
-    stalled: Option<Pin<Box<tokio::time::Sleep>>>,
-}
-
-impl WriteStallTimeout {
-    fn new(stream: tokio::net::TcpStream, timeout: Duration) -> Self {
-        Self { stream, timeout, stalled: None }
-    }
-
-    /// Times the stalls of one write: the timer starts on the first poll that makes no progress, any progress at all
-    /// clears it, and an elapsed timer becomes the error the connection ends on.
-    fn poll_progress<T>(
-        &mut self,
-        context: &mut Context<'_>,
-        progress: Poll<std::io::Result<T>>,
-    ) -> Poll<std::io::Result<T>> {
-        if progress.is_ready() {
-            self.stalled = None;
-            return progress;
-        }
-        let timeout = self.timeout;
-        let stalled = self.stalled.get_or_insert_with(|| Box::pin(tokio::time::sleep(timeout)));
-        stalled.as_mut().poll(context).map(|()| Err(std::io::ErrorKind::TimedOut.into()))
-    }
-}
-
-impl tokio::io::AsyncRead for WriteStallTimeout {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().stream).poll_read(context, buffer)
-    }
-}
-
-impl tokio::io::AsyncWrite for WriteStallTimeout {
-    fn poll_write(self: Pin<&mut Self>, context: &mut Context<'_>, buffer: &[u8]) -> Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-        let progress = Pin::new(&mut this.stream).poll_write(context, buffer);
-        this.poll_progress(context, progress)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        let progress = Pin::new(&mut this.stream).poll_flush(context);
-        this.poll_progress(context, progress)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        let progress = Pin::new(&mut this.stream).poll_shutdown(context);
-        this.poll_progress(context, progress)
-    }
-
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffers: &[std::io::IoSlice<'_>],
-    ) -> Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-        let progress = Pin::new(&mut this.stream).poll_write_vectored(context, buffers);
-        this.poll_progress(context, progress)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.stream.is_write_vectored()
     }
 }
 
@@ -2053,6 +1991,10 @@ mod dashboard_files_tests {
 const SESSION_COOKIE_PREFIX: &str = "ironqueue_session_";
 const ACTION_HEADER: &str = "x-ironqueue-request";
 const ACTION_HEADER_VALUE: &[u8] = b"dashboard";
+/// Maximum UTF-8 bytes stored for a dashboard username or password.
+const MAX_CREDENTIAL_BYTES: usize = 512;
+/// Enough for two maximum-sized credentials after worst-case form or JSON escaping, with room for field names.
+const CREDENTIAL_REQUEST_BODY_LIMIT: usize = 8 * 1024;
 /// The browser's own statement of where a request came from; see
 /// [`is_cross_site_post`].
 const SITE_HEADER: &str = "sec-fetch-site";
@@ -2717,13 +2659,19 @@ fn basic_credentials(headers: &HeaderMap) -> Option<&[u8]> {
 
 fn account_router(auth: Arc<DashboardAuthState>) -> Router {
     Router::new()
-        .route("/api/account/password", post(change_password))
+        .route(
+            "/api/account/password",
+            post(change_password).layer(DefaultBodyLimit::max(CREDENTIAL_REQUEST_BODY_LIMIT)),
+        )
         .route("/api/account/logout", post(logout))
         .with_state(auth)
 }
 
 fn login_router(auth: Arc<DashboardAuthState>) -> Router {
-    Router::new().route("/login", get(login_page).post(login)).with_state(auth)
+    Router::new()
+        .route("/login", get(login_page))
+        .route("/login", post(login).layer(DefaultBodyLimit::max(CREDENTIAL_REQUEST_BODY_LIMIT)))
+        .with_state(auth)
 }
 
 async fn require_auth(
@@ -2820,7 +2768,7 @@ async fn change_password(
     if change.new_password.chars().count() < 8 {
         return Err(DashboardApiError::BadRequest("new password must be at least 8 characters"));
     }
-    if change.new_password.len() > 1_024 {
+    if change.new_password.len() > MAX_CREDENTIAL_BYTES {
         return Err(DashboardApiError::BadRequest("new password is too long"));
     }
     let credential_revision = match auth.check_credentials(client, &auth.username, &change.current_password).await {
@@ -3004,6 +2952,9 @@ fn base64(input: impl AsRef<[u8]>) -> String {
 
 #[cfg(test)]
 mod dashboard_auth_tests {
+    use axum::body::Body;
+    use axum::http::Request;
+
     use super::*;
 
     #[test]
@@ -3079,6 +3030,123 @@ mod dashboard_auth_tests {
         assert!(insecure.session_cookie_name.starts_with(SESSION_COOKIE_PREFIX));
         let mounted = DashboardAuthState::new("admin".into(), "secret".into(), "/admin".into(), true, 0);
         assert!(mounted.session_cookie_name.starts_with(SESSION_COOKIE_PREFIX));
+    }
+
+    #[test]
+    fn test_dashboard_refuses_credentials_larger_than_its_request_limit_can_represent() {
+        for (username, password) in [
+            ("u".repeat(MAX_CREDENTIAL_BYTES + 1), "password".to_string()),
+            ("admin".to_string(), "p".repeat(MAX_CREDENTIAL_BYTES + 1)),
+        ] {
+            let result = Dashboard::new(Vec::<Queue>::new()).basic_auth(username, password).router();
+            match result {
+                Err(Error::Config(message)) => assert!(message.contains("at most 512 bytes"), "{message}"),
+                Err(error) => panic!("unexpected error: {error}"),
+                Ok(_) => panic!("an oversized dashboard credential built a router"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_credential_routes_limit_request_bodies_before_authentication() {
+        let auth = test_auth_state();
+        let login = login_router(auth.clone());
+        let oversized = "x".repeat(CREDENTIAL_REQUEST_BODY_LIMIT);
+        let response = login
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("username=admin&password={oversized}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(auth.throttle.buckets.lock().unwrap().is_empty(), "an oversized login reached the auth throttle");
+
+        let response = login
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from("username=admin&password=secret"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let cookie = response.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap();
+
+        let account = account_router(auth);
+        let response = account
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/account/password")
+                    .header(header::COOKIE, cookie)
+                    .header(ACTION_HEADER, ACTION_HEADER_VALUE)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "current_password": "secret", "new_password": oversized }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let response = account
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/account/password")
+                    .header(header::COOKIE, cookie)
+                    .header(ACTION_HEADER, ACTION_HEADER_VALUE)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"current_password":"secret","new_password":"replacement"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Every accepted credential still fits after its transport applies the largest possible expansion. A non-ASCII
+        // form byte becomes `%XX`, while a JSON control byte becomes `\u00XX`.
+        let maximum = "é".repeat(MAX_CREDENTIAL_BYTES / "é".len());
+        let encoded_maximum = "%C3%A9".repeat(MAX_CREDENTIAL_BYTES / "é".len());
+        let auth = DashboardAuthState::new(maximum.clone(), maximum, String::new(), true, 0);
+        let response = login_router(auth)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("username={encoded_maximum}&password={encoded_maximum}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let current = "\0".repeat(MAX_CREDENTIAL_BYTES);
+        let next = "\u{1}".repeat(MAX_CREDENTIAL_BYTES);
+        let auth = DashboardAuthState::new("admin".into(), current.clone(), String::new(), true, 0);
+        let response = account_router(auth)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/account/password")
+                    .header(ACTION_HEADER, ACTION_HEADER_VALUE)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "current_password": current, "new_password": next }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// The Fetch-Metadata fallback: `Origin` names an authority or nothing,

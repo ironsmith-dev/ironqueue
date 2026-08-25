@@ -1718,46 +1718,88 @@ async fn test_standalone_dashboard_caps_accepted_connections(pool: PgPool) {
     run.await.unwrap().unwrap();
 }
 
-/// A client that stops reading its response must lose the connection. hyper has
-/// no write-side deadline and a connection permit is taken before the accept it
-/// belongs to, so clients that ask for a large file and never read it hold every
-/// slot forever — and `/health` is then never accepted, which is a restart for a
-/// worker that is fine.
+/// A client that slowly reads its response must lose the connection by a fixed deadline. A permit is acquired before
+/// accepting each connection, so clients that pipeline a large public file and occasionally make write progress would
+/// otherwise hold every slot forever. `/health` would then never be accepted, which is a restart for a worker that is
+/// fine.
 #[sqlx::test(migrations = "./migrations")]
-async fn test_served_dashboard_drops_a_client_that_stops_reading(pool: PgPool) {
+async fn test_served_dashboard_drops_a_slow_reader_that_keeps_making_progress(pool: PgPool) {
     const CONNECTIONS: usize = 2;
-    // The 81 KB static file, asked for enough times that no pair of socket buffers can absorb the responses: the
-    // server is left blocked mid-write against a receive window that never opens.
+    const CONNECTION_DEADLINE: Duration = Duration::from_secs(1);
+    // The 81 KB static file, asked for enough times that socket buffers and the deliberately slow reads below cannot
+    // finish all the responses before the assertion.
     const REQUESTS: usize = 64;
     let db = TestDb::new(pool.clone()).await;
     let dashboard = dashboard([db.queue.clone()])
         .serve_on("127.0.0.1", 0)
         .max_connections(CONNECTIONS)
-        // Far past the wait below, so the slots can only be freed by the write the stalled clients are blocking:
-        // hyper arms the header deadline between keep-alive requests too, and would otherwise end them itself.
+        // Longer than the connection deadline, so Hyper's keep-alive header timer cannot free these slots first.
         .header_read_timeout(Duration::from_secs(30))
-        .request_timeout(Duration::from_millis(500));
+        .request_timeout(CONNECTION_DEADLINE);
     let mut handle = dashboard.server_handle();
     let shutdown = CancellationToken::new();
     let run = tokio::spawn(dashboard.run_until(shutdown.clone()));
     let address = handle.wait_until_ready().await.unwrap();
 
-    let mut stalled = Vec::new();
+    let stop_reading = CancellationToken::new();
+    let readers_ready = Arc::new(tokio::sync::Barrier::new(CONNECTIONS + 1));
+    let slow_read_started = tokio::time::Instant::now();
+    let mut slow_readers = Vec::new();
     for _ in 0..CONNECTIONS {
         let socket = tokio::net::TcpSocket::new_v4().unwrap();
         socket.set_recv_buffer_size(1024).unwrap();
         let mut stream = socket.connect(address).await.unwrap();
         let requests = format!("GET /static/pico.min.css HTTP/1.1\r\nHost: {address}\r\n\r\n").repeat(REQUESTS);
         stream.write_all(requests.as_bytes()).await.unwrap();
-        stalled.push(stream);
+        let stop_reading = stop_reading.clone();
+        let readers_ready = Arc::clone(&readers_ready);
+        slow_readers.push(tokio::spawn(async move {
+            let mut buffer = [0_u8; 1024];
+            for _ in 0..3 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let read = tokio::time::timeout(Duration::from_millis(100), stream.read(&mut buffer))
+                    .await
+                    .expect("a slow reader received no response bytes before the connection deadline")
+                    .expect("a slow reader was disconnected before the connection deadline");
+                assert!(read > 0, "a slow reader reached EOF before the connection deadline");
+            }
+
+            readers_ready.wait().await;
+            loop {
+                tokio::select! {
+                    _ = stop_reading.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                        match stream.read(&mut buffer).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                }
+            }
+        }));
     }
 
-    let response = tokio::time::timeout(Duration::from_secs(5), http_get(address, "/health", None))
+    readers_ready.wait().await;
+    let readers_confirmed = tokio::time::Instant::now();
+    assert!(
+        slow_read_started.elapsed() + Duration::from_millis(100) < CONNECTION_DEADLINE,
+        "the slow readers did not make progress early enough to check the pre-deadline connection state"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), http_get(address, "/health", None)).await.is_err(),
+        "the server released a slow reader before its connection deadline"
+    );
+
+    tokio::time::sleep_until(readers_confirmed + CONNECTION_DEADLINE + Duration::from_millis(200)).await;
+    let response = tokio::time::timeout(Duration::from_secs(2), http_get(address, "/health", None))
         .await
-        .expect("clients that stopped reading kept every connection slot");
+        .expect("slow readers making progress kept every connection slot past the absolute deadline");
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
 
-    drop(stalled);
+    stop_reading.cancel();
+    for slow_reader in slow_readers {
+        slow_reader.await.unwrap();
+    }
     shutdown.cancel();
     run.await.unwrap().unwrap();
 }
@@ -3624,6 +3666,70 @@ async fn dashboard_change_password(router: &Router, cookie: &str, current: &str,
         )
         .await
         .unwrap()
+}
+
+/// Credential bodies are tiny in normal use. Letting their extractors inherit Axum's 2 MiB default meant that many
+/// public login requests could make hundreds of MiB of raw and decoded credentials coexist before the handler could
+/// reject them. The limit must count actual body bytes without relying on a `Content-Length` header, and a refusal must
+/// happen before the request can spend the client's authentication budget.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_dashboard_limits_credential_request_bodies(pool: PgPool) {
+    const OVERSIZED_CREDENTIAL_BYTES: usize = 8 * 1024;
+    let db = TestDb::new(pool.clone()).await;
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let oversized_form = format!("username=admin&password={}", "x".repeat(OVERSIZED_CREDENTIAL_BYTES));
+
+    // More than one full authentication burst, all from one client. If extraction reaches the handler, these requests
+    // spend its entire budget before the valid login below arrives.
+    let mut requests = tokio::task::JoinSet::new();
+    for _ in 0..32 {
+        let router = router.clone();
+        let body = oversized_form.clone();
+        requests.spawn(async move {
+            router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/login")
+                        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                        .extension(dashboard_peer(1))
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+    }
+    while let Some(response) = requests.join_next().await {
+        assert_eq!(response.unwrap().status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    let login = dashboard_login_from(&router, Some(dashboard_peer(1)), "s3cret").await;
+    assert_eq!(login.status(), StatusCode::SEE_OTHER, "oversized bodies spent the login budget");
+    let cookie = login.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_string();
+
+    let oversized_change = json!({
+        "current_password": "s3cret",
+        "new_password": "x".repeat(OVERSIZED_CREDENTIAL_BYTES),
+    });
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/account/password")
+                .header(header::COOKIE, &cookie)
+                .header("x-ironqueue-request", "dashboard")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(oversized_change.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let response = dashboard_change_password(&router, &cookie, "s3cret", "replacement").await;
+    assert_eq!(response.status(), StatusCode::OK, "the body limit refused an ordinary password change");
 }
 
 /// The minimum is stated in characters and was measured in `String::len()`,

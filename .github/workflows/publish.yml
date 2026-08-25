@@ -1,21 +1,18 @@
 name: publish
 
-run-name: Publish v${{ inputs.version }}
+run-name: Publish v${{ github.event.client_payload.version }}
 
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: Semantic version (x.y.z)
-        required: true
-        type: string
+  # Send event_type=publish with client_payload.version through the repository dispatch API.
+  repository_dispatch:
+    types: [publish]
 
 concurrency:
-  group: publish-${{ inputs.version }}
+  group: publish-${{ github.event.client_payload.version }}
   cancel-in-progress: false
 
 env:
-  VERSION: ${{ inputs.version }}
+  VERSION: ${{ github.event.client_payload.version }}
 
 jobs:
   check:
@@ -33,8 +30,20 @@ jobs:
       contents: write
       id-token: write
     steps:
+      - name: Validate release source
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          expected_ref="refs/heads/$DEFAULT_BRANCH"
+          if [[ "$GITHUB_REF" != "$expected_ref" ]]; then
+              echo "repository dispatch resolved to $GITHUB_REF instead of $expected_ref" >&2
+              exit 1
+          fi
+
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
 
       - name: Validate version
         env:
