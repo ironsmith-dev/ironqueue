@@ -387,6 +387,13 @@ fn test_worker(queue: Queue) -> WorkerBuilder {
         .shutdown_grace(Duration::from_secs(5))
 }
 
+async fn wait_for_worker_lease(queue: &Queue, worker_id: Uuid) {
+    wait_for_some(Duration::from_secs(5), Duration::from_millis(10), "worker did not register its lease", || async {
+        list_workers(queue).await.iter().any(|worker| worker.id == worker_id).then_some(())
+    })
+    .await;
+}
+
 /// Polls until the job reaches a terminal status (or the deadline passes).
 async fn wait_terminal(queue: &Queue, id: Uuid, secs: u64) -> ironqueue::JobRow {
     wait_for_some(Duration::from_secs(secs), Duration::from_millis(25), &format!("job {id} never finished"), || async {
@@ -1402,10 +1409,12 @@ async fn test_sweeper_abort_racing_a_retryable_failure_still_retries(pool: PgPoo
         .timers(WorkerTimers { abort: Duration::from_secs(5), ..test_timers() })
         .build()
         .unwrap();
+    let worker_id = worker.id();
     let token = CancellationToken::new();
     let run = tokio::spawn(worker.run_until(token.clone()));
 
     state.started.notified().await;
+    wait_for_worker_lease(&db.queue, worker_id).await;
     backdate_job_liveness(&db, handle.id()).await;
     assert_eq!(sweeper.sweep().await.unwrap().cancelling, vec![handle.id()]);
     state.release.notify_one();
@@ -1440,10 +1449,12 @@ async fn test_user_abort_during_the_sweeper_marked_window_wins_over_the_retry(po
         .timers(WorkerTimers { abort: Duration::from_secs(5), ..test_timers() })
         .build()
         .unwrap();
+    let worker_id = worker.id();
     let token = CancellationToken::new();
     let run = tokio::spawn(worker.run_until(token.clone()));
 
     state.started.notified().await;
+    wait_for_worker_lease(&db.queue, worker_id).await;
     backdate_job_liveness(&db, handle.id()).await;
     assert_eq!(sweeper.sweep().await.unwrap().cancelling, vec![handle.id()]);
     assert!(
@@ -1488,6 +1499,7 @@ async fn test_sweeper_abort_racing_a_retryable_failure_keeps_the_handler_error(p
         .timers(WorkerTimers { abort: Duration::from_secs(5), ..test_timers() })
         .build()
         .unwrap();
+    let worker_id = worker.id();
     let token = CancellationToken::new();
     let run = tokio::spawn(worker.run_until(token.clone()));
 
@@ -1495,6 +1507,7 @@ async fn test_sweeper_abort_racing_a_retryable_failure_keeps_the_handler_error(p
     // the failure it returns next lands on an `aborting` row: `retry` is
     // refused and the swept-abort retry is what requeues it.
     state.started.notified().await;
+    wait_for_worker_lease(&db.queue, worker_id).await;
     backdate_job_liveness(&db, handle.id()).await;
     assert_eq!(sweeper.sweep().await.unwrap().cancelling, vec![handle.id()]);
     state.release.notify_one();
@@ -1535,10 +1548,12 @@ async fn test_successful_handler_finishes_through_a_sweeper_abort(pool: PgPool) 
         .timers(WorkerTimers { abort: Duration::from_secs(5), ..test_timers() })
         .build()
         .unwrap();
+    let worker_id = worker.id();
     let token = CancellationToken::new();
     let run = tokio::spawn(worker.run_until(token.clone()));
 
     state.started.notified().await;
+    wait_for_worker_lease(&db.queue, worker_id).await;
     backdate_job_liveness(&db, handle.id()).await;
     assert_eq!(sweeper.sweep().await.unwrap().cancelling, vec![handle.id()]);
     state.release.notify_one();
@@ -1569,10 +1584,12 @@ async fn test_final_handler_failure_finishes_through_a_sweeper_abort(pool: PgPoo
         .timers(WorkerTimers { abort: Duration::from_secs(5), ..test_timers() })
         .build()
         .unwrap();
+    let worker_id = worker.id();
     let token = CancellationToken::new();
     let run = tokio::spawn(worker.run_until(token.clone()));
 
     state.started.notified().await;
+    wait_for_worker_lease(&db.queue, worker_id).await;
     backdate_job_liveness(&db, handle.id()).await;
     assert_eq!(sweeper.sweep().await.unwrap().cancelling, vec![handle.id()]);
     state.release.notify_one();
