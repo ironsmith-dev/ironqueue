@@ -9,6 +9,33 @@ Async and cron jobs for Rust, backed by PostgreSQL 18+.
 - Retry, delay, prioritize, deduplicate, and wait for jobs.
 - Inspect queues, workers, and jobs in the built-in dashboard.
 
+## Quick Start
+
+IronQueue needs Rust 1.95 or newer and PostgreSQL 18 or newer. Add it to an application with:
+
+```toml
+[dependencies]
+anyhow = "1"
+ironqueue = "0.1"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+The `dashboard` feature is enabled by default. Queue-only applications can omit its web dependencies with
+`ironqueue = { version = "0.1", default-features = false }`.
+
+To run this repository's compiled examples against its development database:
+
+```shell
+docker compose up -d --wait
+export DATABASE_URL=postgres://ironqueue:ironqueue@localhost:5439/ironqueue
+cargo run -p ironqueue --example worker
+```
+
+In a second terminal, export the same `DATABASE_URL` and run `cargo run -p ironqueue --example enqueue`. The first
+connection creates or upgrades the `ironqueue` schema, so the database role needs DDL permission during setup. See
+Technical Notes for a least-privilege production setup and durability requirements.
+
 ## Enqueueing Jobs
 
 Define a job and start a worker:
@@ -201,6 +228,15 @@ async fn main() -> anyhow::Result<()> {
 ## Technical Notes
 
 - At-least-once delivery (requires PostgreSQL to have `fsync` and `synchronous_commit` enabled).
+- Connect directly to PostgreSQL or through a proxy in session pooling mode. IronQueue keeps a dedicated `LISTEN`
+  session for wakeups and a session-scoped advisory lock for sweeper leadership. PgBouncer transaction and statement
+  pooling are unsupported because they do not preserve that session state.
+- Every worker for one queue must register every job name that can appear on that queue. Missing handlers safely
+  bounce jobs with an attempt refund, keep processing known jobs, and degrade `Worker::health` until the old worker is
+  replaced.
+  Use separate queue names for permanently different worker capabilities.
+- Cron revisions only move forward. Old workers briefly report degraded scheduler health during a rolling deployment.
+  After a rollback, recover by deploying the old definition under a revision higher than the stored one.
 - Job payloads, job results, job metadata, worker stats, and worker metadata are each limited to 1 MiB of serialized
   JSON. IronQueue rejects oversized documents before writing anything.
 - Every queue connection checks IronQueue's migration history and applies missing migrations automatically. A current
@@ -211,3 +247,5 @@ async fn main() -> anyhow::Result<()> {
 - A least-privilege deployment can install the published migration command with `cargo install ironqueue`, then run
   `DATABASE_URL=postgres://schema-owner:password@host/database ironqueue-migrate` as its release step. The application
   can then start with its normal restricted database role.
+- Dashboard passwords must contain at least eight characters. Password changes and browser sessions live in one
+  dashboard process only; update the configured secret to rotate it across restarts or multiple dashboard processes.

@@ -1022,9 +1022,9 @@ async fn test_cron_higher_revision_takes_authority_and_degrades_lower_workers(po
         30,
         "changing the expression did not reset the durable cursor"
     );
-    // Being superseded is the normal state of a not-yet-upgraded worker during
-    // a rolling deploy: it stops scheduling that cron but stays healthy, so an
-    // orchestrator probing `/health` does not restart a perfectly good process.
+    // Being superseded is normal for a not-yet-upgraded worker during a rolling
+    // deploy, but is permanent after a rollback. The worker stays operational
+    // and exposes the condition through degraded scheduler health.
     //
     // Retire the authority and drag the cursor into the past first. The takeover
     // left the cursor a minute away, so nothing was due in the window below.
@@ -1037,8 +1037,14 @@ async fn test_cron_higher_revision_takes_authority_and_degrades_lower_workers(po
     // publish the occurrence now sitting due.
     wait_for_scheduling_passes(&db.database, 2).await;
     let snapshot = lower_health.snapshot();
-    assert_eq!(snapshot.status, WorkerHealthStatus::Ready, "{snapshot:?}");
-    assert!(!snapshot.failures.iter().any(|failure| failure.component == WorkerComponent::Scheduler), "{snapshot:?}");
+    assert_eq!(snapshot.status, WorkerHealthStatus::Degraded, "{snapshot:?}");
+    assert!(
+        snapshot.failures.iter().any(|failure| {
+            failure.component == WorkerComponent::Scheduler
+                && failure.message.contains("superseded by durable revision 2")
+        }),
+        "{snapshot:?}"
+    );
     // ...and it really has stopped advancing the superseded schedule, having
     // published nothing against a revision that is no longer its own.
     assert_eq!(
@@ -1062,8 +1068,9 @@ async fn test_cron_higher_revision_takes_authority_and_degrades_lower_workers(po
 /// revision has taken over is refused at reconciliation, by the UPSERT's
 /// `revision < EXCLUDED.revision` guard, and never reaches scheduling at all.
 /// That is every not-yet-restarted process in a rolling deploy, so it must stay
-/// healthy, leave the authority's revision alone, and — the point of the whole
-/// mechanism — publish nothing for a cron that is due right now.
+/// operational but degraded, leave the authority's revision alone, and — the
+/// point of the whole mechanism — publish nothing for a cron that is due right
+/// now.
 #[sqlx::test(migrations = "./migrations")]
 async fn test_cron_reconcile_refuses_a_worker_whose_revision_is_already_superseded(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
@@ -1092,7 +1099,14 @@ async fn test_cron_reconcile_refuses_a_worker_whose_revision_is_already_supersed
     wait_for_scheduling_passes(&db.database, 2).await;
 
     let snapshot = health.snapshot();
-    assert_eq!(snapshot.status, WorkerHealthStatus::Ready, "{snapshot:?}");
+    assert_eq!(snapshot.status, WorkerHealthStatus::Degraded, "{snapshot:?}");
+    assert!(
+        snapshot.failures.iter().any(|failure| {
+            failure.component == WorkerComponent::Scheduler
+                && failure.message.contains("superseded by durable revision 9")
+        }),
+        "{snapshot:?}"
+    );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT revision FROM ironqueue.cron_schedules WHERE queue = $1 AND dedupe_key = $2",

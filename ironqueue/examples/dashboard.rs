@@ -2,7 +2,7 @@
 //! drift from the API. Run it against the Docker Compose Postgres:
 //!
 //! `DATABASE_URL=postgres://ironqueue:ironqueue@localhost:5439/ironqueue \
-//!  IRONQUEUE_DASHBOARD_PASSWORD=secret cargo run --example dashboard`
+//!  IRONQUEUE_DASHBOARD_PASSWORD=local-password cargo run --example dashboard`
 
 use ironqueue::{Dashboard, Queue};
 

@@ -1678,6 +1678,7 @@ async fn test_a_worker_missing_the_handler_bounces_the_job_with_a_refund(pool: P
         .dequeue_timeout(Duration::from_millis(200))
         .build()
         .unwrap();
+    let health = worker.health();
     let before = jiff::Timestamp::now();
     worker.run_until(CancellationToken::new()).await.unwrap();
 
@@ -1691,6 +1692,13 @@ async fn test_a_worker_missing_the_handler_bounces_the_job_with_a_refund(pool: P
         "the bounce must delay the row so the same worker does not respin it: scheduled_at {}",
         row.scheduled_at
     );
+    let failure = health
+        .snapshot()
+        .failures
+        .into_iter()
+        .find(|failure| failure.component == WorkerComponent::Dispatch)
+        .expect("an unhandled job must degrade dispatch health");
+    assert!(failure.message.contains("counts"), "{}", failure.message);
 
     // A worker that registers the handler picks the job up once the delay
     // lapses; collapse the delay rather than wait it out.

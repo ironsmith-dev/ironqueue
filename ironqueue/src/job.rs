@@ -1142,10 +1142,10 @@ pub struct CronOptions {
     /// remaining worker superseded by a revision none of them holds: they log
     /// the supersession, stop scheduling that cron, and — because a superseded
     /// cron is filed once and never re-evaluated — never schedule it again, on
-    /// any worker, however long the rollback lasts. Ordinary jobs keep flowing
-    /// throughout and [`Worker::health`](crate::Worker::health) stays clean,
-    /// because from each worker's point of view this is the ordinary
-    /// mid-deploy state.
+    /// any worker, however long the rollback lasts. Ordinary jobs keep flowing,
+    /// but [`Worker::health`](crate::Worker::health) reports the scheduler as
+    /// degraded. That signal is expected briefly during a rolling deploy and
+    /// remains until every old worker has been replaced.
     ///
     /// Recovering means rolling *forward*: deploy the old definition under a
     /// revision above the one that superseded it. Lowering the stored revision
@@ -2128,7 +2128,7 @@ pub(crate) fn json_exceeds_depth(value: &Value, budget: usize) -> bool {
 /// back, carrying a NUL, or serializing past [`MAX_JSON_DOCUMENT_BYTES`] —
 /// naming `field` in the message. `Err` carries the message alone, so a caller
 /// can wrap it in whichever error its layer reports —
-/// [`Error::Config`](crate::Error::Config) before a write, a
+/// [`Error::Config`] before a write, a
 /// [`JobError`] for a handler's result.
 ///
 /// The three checks in one place because their *order* is load-bearing and was
@@ -2566,7 +2566,8 @@ impl<J: JobType> JobHandle<J> {
     ///
     /// Resolution is push-based (the queue's completion NOTIFY channel) with
     /// a polling fallback, so results arrive promptly even if a notification
-    /// is lost. Failures surface as [`Error::Job`]; `None` waits forever.
+    /// is lost. The timeout covers every database read made by this operation.
+    /// Failures surface as [`Error::Job`]; `None` waits forever.
     /// Delete-immediately jobs have no durable result and cannot be waited on,
     /// except for a queued abort that is still present as a terminal row.
     pub async fn wait(&self, timeout: Option<Duration>) -> Result<J::Output, Error> {
@@ -2575,6 +2576,15 @@ impl<J: JobType> JobHandle<J> {
 
     /// Like [`JobHandle::wait`] but returns the raw JSON result.
     pub async fn wait_value(&self, timeout: Option<Duration>) -> Result<Value, Error> {
+        match timeout {
+            Some(timeout) => {
+                tokio::time::timeout(timeout, self.wait_value_inner()).await.map_err(|_| Error::WaitTimeout)?
+            }
+            None => self.wait_value_inner().await,
+        }
+    }
+
+    async fn wait_value_inner(&self) -> Result<Value, Error> {
         if self.retention == JobRetention::DeleteImmediately {
             // Queued aborts intentionally remain until sweep, so a caller that
             // already aborted may still read that terminal result. Running or
@@ -2588,10 +2598,7 @@ impl<J: JobType> JobHandle<J> {
                 "wait requires result retention; DeleteImmediately jobs have no durable result".into(),
             ));
         }
-        match timeout {
-            Some(t) => tokio::time::timeout(t, self.wait_inner()).await.map_err(|_| Error::WaitTimeout)?,
-            None => self.wait_inner().await,
-        }
+        self.wait_inner().await
     }
 
     /// How a wait reports an id whose row is not there any more: as the

@@ -11,6 +11,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+exclude = ["tests/**"]
 
 [lib]
 name = "ironqueue"
@@ -20,22 +21,30 @@ name = "integration"
 path = "tests/integration.rs"
 
 [features]
-default = []
+default = ["dashboard"]
+dashboard = [
+    "dep:axum",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:include_dir",
+    "dep:tower",
+    "tokio/net",
+]
 # Internal: exposes the raw queue protocol to this crate's own integration
 # tests. Never enable it from application code; it bypasses the Consumer and
 # Attempt guards and carries no stability guarantee. The leading underscore
 # keeps it off the feature list docs.rs renders.
-_test = []
+_test = ["dashboard"]
 
 [dependencies]
 ironqueue-macros.workspace = true
 
 anyhow.workspace = true
-axum.workspace = true
+axum = { workspace = true, optional = true }
 cronexpr.workspace = true
-include_dir.workspace = true
-hyper.workspace = true
-hyper-util.workspace = true
+include_dir = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
 jiff.workspace = true
 jiff-sqlx.workspace = true
 rand.workspace = true
@@ -43,9 +52,9 @@ serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["net"] }
+tokio.workspace = true
 tokio-util.workspace = true
-tower.workspace = true
+tower = { workspace = true, optional = true }
 tracing.workspace = true
 uuid.workspace = true
 
@@ -57,3 +66,7 @@ ironqueue = { path = ".", features = ["_test"] }
 tokio = { workspace = true, features = ["io-util", "net", "rt-multi-thread", "test-util"] }
 tracing-subscriber.workspace = true
 trybuild.workspace = true
+
+[[example]]
+name = "dashboard"
+required-features = ["dashboard"]

@@ -1,3 +1,5 @@
+//! Applies the embedded IronQueue database migrations and exits.
+
 use anyhow::Context;
 use ironqueue::Queue;
 

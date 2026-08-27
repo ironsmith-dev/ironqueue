@@ -56,6 +56,5 @@ if ! crate_exists ironqueue-macros; then
 elif ! crate_exists ironqueue; then
     cargo publish --locked -p ironqueue "${publish_timeout[@]}"
 else
-    echo "both crates are already published at $version" >&2
-    exit 1
+    echo "both crates are already published at $version; nothing to do"
 fi

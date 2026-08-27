@@ -226,6 +226,19 @@ mod enqueue_and_wait {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn test_wait_timeout_covers_delete_immediately_outcome_read(pool: PgPool) {
+        let query_pool = pool_with_max(&pool, 1).await;
+        let db = TestDb::new(query_pool.clone()).await;
+        let handle = db.queue.enqueue(ephemeral::job(())).await.unwrap().unwrap();
+        let _held = query_pool.acquire().await.unwrap();
+
+        let started = tokio::time::Instant::now();
+        let error = handle.wait_value(Some(Duration::from_millis(100))).await.unwrap_err();
+        assert!(matches!(error, Error::WaitTimeout), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1), "the outcome read escaped the caller's deadline");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn test_enqueue_and_wait_rejects_delete_immediately_before_enqueue(pool: PgPool) {
         let db = TestDb::new(pool.clone()).await;
         let error = db.queue.enqueue_and_wait(ephemeral::job(()), Some(Duration::from_secs(1))).await.unwrap_err();
@@ -448,7 +461,7 @@ mod enqueue_and_wait {
         let db = TestDb::new(pool.clone()).await;
         let (token, run) = spawn_worker(db.queue.clone());
 
-        // Blast garbage onto the done channel while a waiter is subscribed; the
+        // Blast garbage onto the done channel while a waiter is subscribed.
         // The listener must log-and-continue, and the real completion still resolves.
         let handle = db.queue.enqueue(double::job(5).delay(Duration::from_millis(700))).await.unwrap().unwrap();
         let waiter = {

@@ -2,6 +2,8 @@ name: check
 
 on:
   push:
+    branches: [main]
+  pull_request:
   workflow_call:
 
 permissions:
@@ -11,12 +13,15 @@ jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        run: rustup toolchain install --no-self-update
+        run: |
+          rustup toolchain install --no-self-update
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
 
       - name: Install dev tools
         uses: taiki-e/install-action@288e746965032cfcc232e09af2daf5f23c14d780 # v2.86.1
@@ -25,3 +30,12 @@ jobs:
 
       - name: Run pre-commit hooks
         run: prek run --all-files
+
+      - name: Check minimum supported Rust version
+        run: cargo +1.95.0 check --locked --workspace --all-targets --all-features
+
+      - name: Check queue-only feature set
+        run: cargo check --locked -p ironqueue --lib --bins --no-default-features
+
+      - name: Run stress tests
+        run: scripts/stress

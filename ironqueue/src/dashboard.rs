@@ -5,7 +5,7 @@
 //!
 //! ```ignore
 //! Dashboard::new([queue])
-//!     .basic_auth("admin", "secret")
+//!     .basic_auth("admin", "password")
 //!     .secure_cookies(false) // only for direct HTTP on a trusted network
 //!     .serve_on("0.0.0.0", 8080)
 //!     .run()
@@ -16,7 +16,7 @@
 //!
 //! ```ignore
 //! let dashboard = Dashboard::new([queue.clone()])
-//!     .basic_auth("admin", "secret")
+//!     .basic_auth("admin", "password")
 //!     .secure_cookies(false) // only for direct HTTP on a trusted network
 //!     .serve_on("0.0.0.0", 8080);
 //! Worker::builder(queue)
@@ -66,6 +66,7 @@
 //! unaffected.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
@@ -375,14 +376,13 @@ impl Dashboard {
     /// credential every client can send, which is a dashboard that looks
     /// protected and admits anyone. [`Dashboard::router`] and
     /// [`Dashboard::serve_on`] refuse it with [`Error::Config`] rather than
-    /// serving it. A password under eight characters is served but logs an
-    /// unmissable warning, the same floor the in-dashboard password change
-    /// enforces.
+    /// serving it. Passwords under eight characters are refused with the same
+    /// floor enforced by the in-dashboard password change.
     ///
     /// The username must not contain `:`, which RFC 7617 forbids in a userid
     /// anyway: HTTP Basic joins the pair with that separator, so a username
     /// carrying one makes the encoded credential ambiguous — `("ops:admin",
-    /// "s3cret")` would be satisfied by the password `admin:s3cret` under the
+    /// "s3cretpw")` would be satisfied by the password `admin:s3cretpw` under the
     /// username `ops` as well. Refused with [`Error::Config`].
     ///
     /// Each value may contain at most 512 bytes. This keeps every accepted credential small enough for the dashboard's
@@ -410,7 +410,7 @@ impl Dashboard {
     /// ```no_run
     /// # fn dashboard(queue: ironqueue::Queue) -> Result<axum::Router, ironqueue::Error> {
     /// let router = ironqueue::Dashboard::new([queue])
-    ///     .basic_auth("admin", "secret")
+    ///     .basic_auth("admin", "password")
     ///     .secure_cookies(false)
     ///     .router()?;
     /// # Ok(router)
@@ -451,7 +451,7 @@ impl Dashboard {
     /// ```no_run
     /// # fn dashboard(queue: ironqueue::Queue) -> Result<axum::Router, ironqueue::Error> {
     /// let router = ironqueue::Dashboard::new([queue])
-    ///     .basic_auth("admin", "secret")
+    ///     .basic_auth("admin", "password")
     ///     // One TLS-terminating proxy, which no client can bypass.
     ///     .trusted_proxy_hops(1)
     ///     .router()?;
@@ -492,16 +492,14 @@ impl Dashboard {
     ///
     /// A reverse proxy that terminates slow clients — any of nginx, HAProxy, Envoy or an ALB in a default
     /// configuration — is what removes that, and it is still the normal place to terminate TLS and what
-    /// [`Dashboard::trusted_proxy_hops`] assumes. It should reject or normalise requests carrying both
-    /// `Content-Length` and `Transfer-Encoding`: hyper accepts that pair and
-    /// prefers the chunked framing rather than refusing the message as RFC 9112
-    /// requires, so a front end that honours `Content-Length` instead and pools
-    /// its upstream connections would have a request-smuggling desync.
+    /// [`Dashboard::trusted_proxy_hops`] assumes. The standalone server rejects requests carrying both
+    /// `Content-Length` and `Transfer-Encoding` and closes their connections. Configure the proxy to reject or
+    /// normalise the same pair so ambiguous framing never crosses either HTTP hop.
     ///
     /// ```no_run
     /// # async fn run(queue: ironqueue::Queue) -> anyhow::Result<()> {
     /// ironqueue::Dashboard::new([queue])
-    ///     .basic_auth("admin", "secret")
+    ///     .basic_auth("admin", "password")
     ///     .secure_cookies(false) // only for direct HTTP on a trusted network
     ///     .serve_on("localhost", 8080)
     ///     .run()
@@ -560,9 +558,9 @@ impl Dashboard {
         // `basic_credentials_match` compares the client's base64 against
         // `base64("{username}:{password}")`, which is what keeps a decoder away
         // from hostile input — but it makes the pair ambiguous when the username
-        // itself carries the separator. Configured as `("ops:admin", "s3cret")`,
-        // the expected string is `ops:admin:s3cret`, which the username `ops`
-        // with the password `admin:s3cret` satisfies equally. The login form
+        // itself carries the separator. Configured as `("ops:admin", "s3cretpw")`,
+        // the expected string is `ops:admin:s3cretpw`, which the username `ops`
+        // with the password `admin:s3cretpw` satisfies equally. The login form
         // compares the two fields separately and refuses that second reading, so
         // one deployment would accept a credential over Basic that it rejects
         // over the form. RFC 7617 forbids a colon in the userid; refuse it here
@@ -575,18 +573,11 @@ impl Dashboard {
                 "dashboard basic_auth username and password must each be at most {MAX_CREDENTIAL_BYTES} bytes"
             )));
         }
-        // The same floor `change_password` enforces, as a warning rather than a
-        // refusal: the configured credential often arrives from an environment
-        // a deploy pipeline owns, and refusing to serve would turn a weak
-        // password into an outage. Serving it silently instead left the
-        // strength policy applying only to rotations, never to the credential
-        // a deployment actually starts with.
+        // Apply the same floor `change_password` enforces. A weak credential is
+        // a configuration error, and failing before the socket binds keeps the
+        // dashboard from starting in an unexpectedly exposed state.
         if password.chars().count() < 8 {
-            tracing::warn!(
-                "dashboard basic_auth password is shorter than eight characters; the in-dashboard \
-                 password change refuses one this short, and the configured credential deserves \
-                 the same floor"
-            );
+            return Err(Error::Config("dashboard basic_auth password must be at least 8 characters".into()));
         }
         self.build_router(worker_health, request_limits)
     }
@@ -685,6 +676,7 @@ impl Dashboard {
         };
         Ok(router
             .merge(health_route)
+            .layer(axum::middleware::from_fn(reject_ambiguous_framing))
             .layer(axum::middleware::from_fn_with_state(self.secure_cookies, security_headers)))
     }
 }
@@ -1062,6 +1054,10 @@ async fn serve_dashboard_connection(
         let router = router.clone();
         let response_ready = response_ready.clone();
         async move {
+            if has_ambiguous_framing(request.headers()) {
+                response_ready.cancel();
+                return Ok::<_, Infallible>(ambiguous_framing_response());
+            }
             let mut request = request.map(axum::body::Body::new);
             request.extensions_mut().insert(ConnectInfo(peer));
             let response = router.oneshot(request).await;
@@ -1086,6 +1082,23 @@ async fn serve_dashboard_connection(
             connection.await
         }
     }
+}
+
+fn has_ambiguous_framing(headers: &HeaderMap) -> bool {
+    headers.contains_key(header::CONTENT_LENGTH) && headers.contains_key(header::TRANSFER_ENCODING)
+}
+
+fn ambiguous_framing_response() -> Response {
+    let mut response = (StatusCode::BAD_REQUEST, "ambiguous HTTP request framing").into_response();
+    response.headers_mut().insert(header::CONNECTION, HeaderValue::from_static("close"));
+    response
+}
+
+async fn reject_ambiguous_framing(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    if has_ambiguous_framing(request.headers()) {
+        return ambiguous_framing_response();
+    }
+    next.run(request).await
 }
 
 #[cfg(test)]
@@ -1131,6 +1144,46 @@ mod dashboard_server_tests {
         let mut response = String::new();
         tokio::time::timeout(Duration::from_secs(1), healthy.read_to_string(&mut response)).await.unwrap().unwrap();
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), run).await.unwrap().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_standalone_server_rejects_ambiguous_request_framing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handled = Arc::clone(&requests);
+        let router = Router::new().route(
+            "/handled",
+            get(move || {
+                handled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { "OK" }
+            }),
+        );
+        let (ready, _) = tokio::sync::watch::channel(None);
+        let bound =
+            DashboardBoundServer { bind: address, listener, router, limits: DashboardServerLimits::default(), ready };
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(serve_dashboard(bound, shutdown.clone()));
+
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(
+                format!(
+                    "POST /handled HTTP/1.1\r\nHost: {address}\r\nContent-Length: 4\r\n\
+                     Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n0\r\n\r\n\
+                     GET /handled HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(1), stream.read_to_string(&mut response)).await.unwrap().unwrap();
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0, "an ambiguous request reached its handler");
 
         shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(1), run).await.unwrap().unwrap().unwrap();
@@ -2055,11 +2108,13 @@ struct DashboardAuthState {
     session_cookie_name: String,
     secure_cookies: bool,
     trusted_proxy_hops: usize,
-    /// Guards the one-shot warning in [`warn_if_throttle_is_unkeyed`]. The
+    /// Guards the one-shot warning in
+    /// [`DashboardAuthState::warn_if_throttle_is_unkeyed`]. The
     /// condition holds for every request once it holds for one, and a line per
     /// request would bury the deployment problem it is reporting.
     unkeyed_throttle_warned: std::sync::Once,
-    /// The same, for the one-shot warning in [`client_of`] about a chain that
+    /// The same, for the one-shot warning in [`DashboardAuthState::client_of`]
+    /// about a chain that
     /// does not reach [`Dashboard::trusted_proxy_hops`].
     short_chain_warned: std::sync::Once,
 }
@@ -2966,7 +3021,7 @@ mod dashboard_auth_tests {
         assert_eq!(base64("foob"), "Zm9vYg==");
         assert_eq!(base64("fooba"), "Zm9vYmE=");
         assert_eq!(base64("foobar"), "Zm9vYmFy");
-        assert_eq!(base64("admin:s3cret"), "YWRtaW46czNjcmV0");
+        assert_eq!(base64("admin:s3cretpw"), "YWRtaW46czNjcmV0cHc=");
     }
 
     #[test]
@@ -3026,9 +3081,9 @@ mod dashboard_auth_tests {
 
         // The prefix is only valid with `Secure` and `Path=/`, so opting out
         // of either keeps the plain name those attributes allow.
-        let insecure = DashboardAuthState::new("admin".into(), "secret".into(), String::new(), false, 0);
+        let insecure = DashboardAuthState::new("admin".into(), "password".into(), String::new(), false, 0);
         assert!(insecure.session_cookie_name.starts_with(SESSION_COOKIE_PREFIX));
-        let mounted = DashboardAuthState::new("admin".into(), "secret".into(), "/admin".into(), true, 0);
+        let mounted = DashboardAuthState::new("admin".into(), "password".into(), "/admin".into(), true, 0);
         assert!(mounted.session_cookie_name.starts_with(SESSION_COOKIE_PREFIX));
     }
 
@@ -3073,7 +3128,7 @@ mod dashboard_auth_tests {
                     .method("POST")
                     .uri("/login")
                     .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .body(Body::from("username=admin&password=secret"))
+                    .body(Body::from("username=admin&password=password"))
                     .unwrap(),
             )
             .await
@@ -3091,7 +3146,7 @@ mod dashboard_auth_tests {
                     .header(header::COOKIE, cookie)
                     .header(ACTION_HEADER, ACTION_HEADER_VALUE)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(json!({ "current_password": "secret", "new_password": oversized }).to_string()))
+                    .body(Body::from(json!({ "current_password": "password", "new_password": oversized }).to_string()))
                     .unwrap(),
             )
             .await
@@ -3106,7 +3161,7 @@ mod dashboard_auth_tests {
                     .header(header::COOKIE, cookie)
                     .header(ACTION_HEADER, ACTION_HEADER_VALUE)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"current_password":"secret","new_password":"replacement"}"#))
+                    .body(Body::from(r#"{"current_password":"password","new_password":"replacement"}"#))
                     .unwrap(),
             )
             .await
@@ -3171,7 +3226,7 @@ mod dashboard_auth_tests {
     #[test]
     fn test_create_session_rejects_validated_credentials_when_password_rotates_before_mint() {
         let auth = test_auth_state();
-        let validated_revision = auth.credentials_match("admin", "secret").unwrap();
+        let validated_revision = auth.credentials_match("admin", "password").unwrap();
 
         // No cookie on the request, so there is no session to re-issue.
         assert!(matches!(
@@ -3184,7 +3239,7 @@ mod dashboard_auth_tests {
     /// The auth state these tests share: secure cookies, mounted at the root,
     /// and trusting no proxy — which is [`Dashboard`]'s default.
     fn test_auth_state() -> Arc<DashboardAuthState> {
-        DashboardAuthState::new("admin".into(), "secret".into(), String::new(), true, 0)
+        DashboardAuthState::new("admin".into(), "password".into(), String::new(), true, 0)
     }
 
     fn test_client(last: u8) -> AuthClient {
@@ -3227,7 +3282,7 @@ mod dashboard_auth_tests {
         // A correct password hands its own attempt straight back, so guessing
         // is what draws the budget down.
         for _ in 0..AUTH_ATTEMPT_BURST {
-            assert!(matches!(auth.check_credentials(client, "admin", "secret").await, CredentialCheck::Accepted(_)));
+            assert!(matches!(auth.check_credentials(client, "admin", "password").await, CredentialCheck::Accepted(_)));
         }
         for _ in 0..AUTH_ATTEMPT_BURST {
             assert!(auth.throttle.spend(interactive(client)));
@@ -3235,7 +3290,7 @@ mod dashboard_auth_tests {
 
         // No comparison happens at all now, so the correct password is refused
         // exactly like a wrong one: the reply says nothing about the guess.
-        assert!(matches!(auth.check_credentials(client, "admin", "secret").await, CredentialCheck::Saturated));
+        assert!(matches!(auth.check_credentials(client, "admin", "password").await, CredentialCheck::Saturated));
         assert!(matches!(auth.check_credentials(client, "admin", "incorrect").await, CredentialCheck::Saturated));
     }
 
@@ -3254,17 +3309,20 @@ mod dashboard_auth_tests {
         for _ in 0..AUTH_ATTEMPT_BURST {
             assert!(auth.throttle.spend(interactive(attacker)));
         }
-        assert!(matches!(auth.check_credentials(attacker, "admin", "secret").await, CredentialCheck::Saturated));
+        assert!(matches!(auth.check_credentials(attacker, "admin", "password").await, CredentialCheck::Saturated));
 
-        assert!(matches!(auth.check_credentials(operator, "admin", "secret").await, CredentialCheck::Accepted(_)));
+        assert!(matches!(auth.check_credentials(operator, "admin", "password").await, CredentialCheck::Accepted(_)));
         // And an anonymous flood with no address at all — everything behind one
         // proxy, or a router nested without connection info — cannot spend the
         // budget of a client that has one either.
         for _ in 0..AUTH_ATTEMPT_BURST {
             assert!(auth.throttle.spend(interactive(AuthClient::Any)));
         }
-        assert!(matches!(auth.check_credentials(AuthClient::Any, "admin", "secret").await, CredentialCheck::Saturated));
-        assert!(matches!(auth.check_credentials(operator, "admin", "secret").await, CredentialCheck::Accepted(_)));
+        assert!(matches!(
+            auth.check_credentials(AuthClient::Any, "admin", "password").await,
+            CredentialCheck::Saturated
+        ));
+        assert!(matches!(auth.check_credentials(operator, "admin", "password").await, CredentialCheck::Accepted(_)));
     }
 
     /// Basic-auth traffic is anybody's to send, so it must not be able to spend
@@ -3281,7 +3339,7 @@ mod dashboard_auth_tests {
             assert!(auth.throttle.spend(AuthThrottleKey { client, channel: AuthChannel::Basic }));
         }
         assert!(matches!(auth.check_basic_credentials(client, &headers).await, CredentialCheck::Saturated));
-        assert!(matches!(auth.check_credentials(client, "admin", "secret").await, CredentialCheck::Accepted(_)));
+        assert!(matches!(auth.check_credentials(client, "admin", "password").await, CredentialCheck::Accepted(_)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -3466,7 +3524,7 @@ mod dashboard_auth_tests {
             AuthClient::Peer(peer.ip()),
             "the header is attacker-controlled until a proxy is trusted"
         );
-        let proxied = DashboardAuthState::new("admin".into(), "secret".into(), String::new(), true, 1);
+        let proxied = DashboardAuthState::new("admin".into(), "password".into(), String::new(), true, 1);
         assert_eq!(proxied.client_of(&headers, &extensions), AuthClient::Peer("203.0.113.5".parse().unwrap()));
         assert_eq!(
             proxied.client_of(&HeaderMap::new(), &extensions),

@@ -16,6 +16,7 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::Error;
+#[cfg(feature = "dashboard")]
 use crate::dashboard::{
     DashboardRuntime, DashboardServer, DashboardServerConfig, bind_dashboard, wait_for_dashboard_exit,
 };
@@ -171,6 +172,14 @@ pub enum WorkerComponent {
     Notification,
     /// Job dequeue/fetch loop.
     Dequeue,
+    /// Dispatching claimed jobs to registered handlers.
+    ///
+    /// A failure means this worker claimed a job name it does not register.
+    /// The job is safely requeued with an attempt refund, but this worker stays
+    /// degraded because its immutable handler registry cannot recover without
+    /// a restart or replacement. This keeps rolling deployments safe while
+    /// making a permanently mismatched fleet visible to health observers.
+    Dispatch,
     /// Recording an attempt's outcome — the other half of the processing path,
     /// and the one that can fail while every other loop stays green.
     ///
@@ -548,6 +557,7 @@ pub struct WorkerBuilder {
     abort_grace: Duration,
     shutdown_grace: Duration,
     metadata: Option<Value>,
+    #[cfg(feature = "dashboard")]
     dashboard: Option<DashboardServer>,
     error: Option<Error>,
 }
@@ -581,7 +591,8 @@ impl WorkerBuilder {
     /// is not lost — the worker requeues it with an attempt refund and a short
     /// delay, which is what makes a rolling deploy safe: jobs of a new type
     /// enqueued before the old workers restart bounce until a new worker picks
-    /// them up.
+    /// them up. The old worker reports [`WorkerComponent::Dispatch`] as failed
+    /// after its first bounce, but keeps processing job names it does handle.
     pub fn register_job<J: JobDefinition>(mut self, _job: J) -> Self {
         self.ensure_handler::<J>();
         self
@@ -813,7 +824,7 @@ impl WorkerBuilder {
     /// # async fn cleanup(_: ()) {}
     /// # async fn run(queue: ironqueue::Queue) -> anyhow::Result<()> {
     /// let dashboard = ironqueue::Dashboard::new([queue.clone()])
-    ///     .basic_auth("admin", "secret")
+    ///     .basic_auth("admin", "password")
     ///     .serve_on("localhost", 8080);
     /// ironqueue::Worker::builder(queue)
     ///     .register_job(cleanup)
@@ -823,6 +834,7 @@ impl WorkerBuilder {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(feature = "dashboard")]
     pub fn dashboard(mut self, server: DashboardServer) -> Self {
         self.dashboard = Some(server);
         self
@@ -946,6 +958,7 @@ impl WorkerBuilder {
 
         let health = WorkerHealthReporter::new();
 
+        #[cfg(feature = "dashboard")]
         let dashboard =
             self.dashboard.map(|dashboard| dashboard.into_server_config(Some(health.subscribe()))).transpose()?;
 
@@ -965,6 +978,7 @@ impl WorkerBuilder {
                 abort_grace: self.abort_grace,
                 shutdown_grace: self.shutdown_grace,
                 metadata: self.metadata,
+                #[cfg(feature = "dashboard")]
                 dashboard,
                 id: Uuid::now_v7(),
                 started: OnceLock::new(),
@@ -1005,6 +1019,7 @@ struct WorkerInner {
     abort_grace: Duration,
     shutdown_grace: Duration,
     metadata: Option<Value>,
+    #[cfg(feature = "dashboard")]
     dashboard: Option<DashboardServerConfig>,
     id: Uuid,
     started: OnceLock<std::time::Instant>,
@@ -1055,6 +1070,7 @@ impl Worker {
             abort_grace: DEFAULT_ABORT_GRACE,
             shutdown_grace: Duration::from_secs(30),
             metadata: None,
+            #[cfg(feature = "dashboard")]
             dashboard: None,
             error: None,
         }
@@ -1107,6 +1123,7 @@ impl Worker {
     async fn run_until_inner(self, shutdown: CancellationToken, dropped: CancellationToken) -> Result<(), Error> {
         let inner = self.inner;
         let _health_stop = WorkerHealthStopGuard(inner.clone());
+        #[cfg(feature = "dashboard")]
         let bound_dashboard = match before_shutdown(&shutdown, &dropped, bind_dashboard(inner.dashboard.as_ref())).await
         {
             Some(bound) => bound?,
@@ -1243,6 +1260,7 @@ impl Worker {
         }
         inner.health.ready();
 
+        #[cfg(feature = "dashboard")]
         let mut dashboard = bound_dashboard.map(DashboardRuntime::start);
 
         // Wait for a shutdown request, (burst) for every processor to drain,
@@ -1250,7 +1268,10 @@ impl Worker {
         let mut fetcher_stopped = false;
         // Scoped so the dashboard borrow ends before shutdown stops the server.
         let mut run_error = {
+            #[cfg(feature = "dashboard")]
             let dashboard_exit = wait_for_dashboard_exit(&mut dashboard);
+            #[cfg(not(feature = "dashboard"))]
+            let dashboard_exit = std::future::pending::<Error>();
             tokio::pin!(dashboard_exit);
 
             tokio::select! {
@@ -1316,6 +1337,7 @@ impl Worker {
         .run(&inner, &mut run_error)
         .await;
 
+        #[cfg(feature = "dashboard")]
         if let Some(dashboard) = dashboard.as_mut()
             && let Err(error) = dashboard.finish_shutdown().await
         {
@@ -1628,6 +1650,7 @@ const UNHANDLED_JOB_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 /// than tracking recency.
 fn warn_unhandled_bounce(inner: &WorkerInner, job: &JobRow) {
     const WARNED_NAMES_CAP: usize = 1024;
+    inner.health.failed(WorkerComponent::Dispatch, &format!("no handler registered for claimed job {:?}", job.name));
     let mut warned_at = inner.unhandled_warned_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if warned_at.len() >= WARNED_NAMES_CAP && !warned_at.contains_key(job.name.as_str()) {
         warned_at.clear();
@@ -3100,10 +3123,11 @@ impl CronSchedulingState {
 
 /// Reconciles every registered cron against the durable schedule rows.
 ///
-/// A cron problem never stops the worker. A superseded revision is the normal
-/// state of a not-yet-upgraded process during a rolling deploy, so it is logged
-/// and skipped without touching health; a rejected definition is a deploy
-/// mistake, so it degrades `Scheduler` health while ordinary jobs keep flowing.
+/// A cron problem never stops the worker. A superseded revision is normal for
+/// a not-yet-upgraded process during a rolling deploy, but it is also the
+/// permanent state after an unsafe rollback. Both supersession and rejected
+/// definitions therefore degrade `Scheduler` health while ordinary jobs keep
+/// flowing.
 async fn reconcile_all_crons(inner: &Arc<WorkerInner>, state: &mut CronSchedulingState) {
     reconcile_crons_into(inner, state, None).await;
     let failures = state.failures();
@@ -3161,6 +3185,10 @@ async fn reconcile_crons_into(
                 );
                 state.unreconciled.remove(&entry.dedupe_key);
                 state.disabled.insert(entry.dedupe_key.clone());
+                state.disabled_reasons.push(format!(
+                    "{}: local cron revision {} is superseded by durable revision {}",
+                    entry.dedupe_key, entry.options.revision, revision
+                ));
             }
             // A rejected *definition* is a deploy mistake that no retry can
             // fix, so it disables the cron. Anything else is treated as
@@ -3301,13 +3329,16 @@ async fn schedule_crons_once(
                 }
             }
             // Another worker published a higher revision while this one was
-            // running. Expected mid-deploy, so it does not degrade health — but
-            // `warn`, not `info`: mid-deploy is the *transient* reading, and the
-            // steady-state one is a rollback, after which this cron never fires
-            // again on any worker and nothing else says so. See
-            // `CronOptions::revision`.
+            // running. This is expected during a rolling deploy, but the same
+            // state is permanent after an unsafe rollback. Disable the local
+            // cron and degrade health without stopping ordinary job handling.
+            // See `CronOptions::revision`.
             Ok(DatabaseCronScheduleResult::Inactive { revision }) => {
                 state.disabled.insert(entry.dedupe_key.clone());
+                state.disabled_reasons.push(format!(
+                    "{}: local cron revision {} is superseded by durable revision {}",
+                    entry.dedupe_key, entry.options.revision, revision
+                ));
                 tracing::warn!(
                     cron = %entry.template.name,
                     dedupe_key = %entry.dedupe_key,

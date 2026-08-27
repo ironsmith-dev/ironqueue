@@ -2965,8 +2965,8 @@ impl Drop for UnacknowledgedClaimGuard {
     }
 }
 
-/// The `error` stored on a row recovered from a consumer [`Attempt`]
-/// (crate::Attempt) that was dropped without settling, so the dashboard shows
+/// The `error` stored on a row recovered from a consumer [`crate::Attempt`]
+/// that was dropped without settling, so the dashboard shows
 /// why the occurrence moved without its owner reporting anything.
 const DROPPED_ATTEMPT_ERROR: &str = "attempt dropped without settlement";
 

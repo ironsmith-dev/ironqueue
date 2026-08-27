@@ -352,6 +352,11 @@ impl Drop for QueueNotifyListener {
 ///
 /// Cheap to clone (internally an `Arc`); clones share the connection pool and
 /// stat counters. Obtain one with [`Queue::connect`] or [`Queue::builder`].
+///
+/// Connections must reach PostgreSQL directly or through a proxy in session
+/// pooling mode. IronQueue uses a dedicated `LISTEN` session for wakeups and a
+/// session-scoped advisory lock for sweeper leadership. PgBouncer transaction
+/// and statement pooling do not preserve those guarantees and are unsupported.
 #[derive(Clone)]
 pub struct Queue {
     database: Arc<Database>,
@@ -565,6 +570,10 @@ impl QueueBuilder {
     /// Use an existing pool instead of connecting from the URL. A lazily
     /// started notification listener opens one additional connection without
     /// occupying a slot in this pool.
+    ///
+    /// The pool must connect directly to PostgreSQL or through a session-mode
+    /// proxy. Transaction and statement pooling are unsupported because the
+    /// listener and sweeper leadership lock depend on PostgreSQL session state.
     pub fn pool(mut self, pool: PgPool) -> Self {
         self.pool = Some(pool);
         self
@@ -690,7 +699,9 @@ impl QueueBuilder {
 
 impl Queue {
     /// Connects to queue `default` in the `ironqueue` schema and applies missing
-    /// migrations. Use [`Queue::builder`] to customize the queue or pool.
+    /// migrations. Use [`Queue::builder`] to customize the queue or pool. The
+    /// URL must reach PostgreSQL directly or through a session-mode proxy; see
+    /// [`Queue`] for why transaction and statement pooling are unsupported.
     pub async fn connect(url: &str) -> Result<Queue, Error> {
         Queue::builder(url).connect().await
     }

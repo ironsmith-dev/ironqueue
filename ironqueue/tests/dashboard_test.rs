@@ -77,7 +77,7 @@ async fn login_cookie(router: &Router) -> String {
                 .method("POST")
                 .uri("/login")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::from("username=admin&password=s3cret"))
+                .body(Body::from("username=admin&password=s3cretpw"))
                 .unwrap(),
         )
         .await
@@ -745,26 +745,26 @@ async fn test_retry_reruns_a_cron_occurrence_when_the_next_occurrence_is_live(po
 async fn test_basic_auth_gates_every_route(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
     let job_id = db.queue.enqueue_raw(new_job("protected", |_| {})).await.unwrap().unwrap();
-    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
 
     let (status, _) = get_json(&router, "/api/queues").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let (status, _) = get_json(&router, "/").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    // echo -n "admin:s3cret" | base64 => YWRtaW46czNjcmV0
-    let (status, _) = request(&router, "GET", "/api/queues", Some("Basic YWRtaW46czNjcmV0")).await;
+    // echo -n "admin:s3cretpw" | base64 => YWRtaW46czNjcmV0cHc=
+    let (status, _) = request(&router, "GET", "/api/queues", Some("Basic YWRtaW46czNjcmV0cHc=")).await;
     assert_eq!(status, StatusCode::OK);
 
-    let (status, body) = request(&router, "GET", "/", Some("Basic YWRtaW46czNjcmV0")).await;
+    let (status, body) = request(&router, "GET", "/", Some("Basic YWRtaW46czNjcmV0cHc=")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.as_str().unwrap().contains("name=\"ironqueue-user\" content=\"admin\""));
 
     // RFC 7617: the auth-scheme token is case-insensitive, and more than one
     // space may separate it from the credentials.
-    let (status, _) = request(&router, "GET", "/api/queues", Some("basic YWRtaW46czNjcmV0")).await;
+    let (status, _) = request(&router, "GET", "/api/queues", Some("basic YWRtaW46czNjcmV0cHc=")).await;
     assert_eq!(status, StatusCode::OK);
-    let (status, _) = request(&router, "GET", "/api/queues", Some("BASIC  YWRtaW46czNjcmV0")).await;
+    let (status, _) = request(&router, "GET", "/api/queues", Some("BASIC  YWRtaW46czNjcmV0cHc=")).await;
     assert_eq!(status, StatusCode::OK);
 
     let (status, _) = request(&router, "GET", "/api/queues", Some("Basic d3Jvbmc6Y3JlZHM=")).await;
@@ -794,7 +794,7 @@ async fn test_basic_auth_gates_every_route(pool: PgPool) {
             Request::builder()
                 .method("POST")
                 .uri(format!("/api/queues/default/jobs/{job_id}/abort"))
-                .header(header::AUTHORIZATION, "Basic YWRtaW46czNjcmV0")
+                .header(header::AUTHORIZATION, "Basic YWRtaW46czNjcmV0cHc=")
                 .header("x-ironqueue-request", "dashboard")
                 .body(Body::empty())
                 .unwrap(),
@@ -844,7 +844,7 @@ async fn test_dashboard_refuses_to_serve_with_no_queues(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn test_dashboard_refuses_basic_auth_with_an_empty_username_or_password(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    for (user, password) in [("admin", ""), ("", "s3cret"), ("", "")] {
+    for (user, password) in [("admin", ""), ("", "s3cretpw"), ("", "")] {
         match dashboard([db.queue.clone()]).basic_auth(user, password).router() {
             Err(Error::Config(message)) => assert!(message.contains("basic_auth"), "{user:?}/{password:?}: {message}"),
             Err(error) => panic!("{user:?}/{password:?}: unexpected error: {error}"),
@@ -869,12 +869,22 @@ async fn test_dashboard_refuses_basic_auth_with_an_empty_username_or_password(po
     }
 
     // Credentials that are actually set still build, and so does an explicit no-auth choice.
-    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
     let (status, _) = request(&router, "GET", "/api/queues", Some("Basic YWRtaW46")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "an empty password must never match a configured one");
     let unprotected = dashboard([db.queue.clone()]).router().unwrap();
     let (status, _) = get_json(&unprotected, "/api/queues").await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn test_dashboard_refuses_a_short_initial_password(pool: PgPool) {
+    let db = TestDb::new(pool.clone()).await;
+    match dashboard([db.queue.clone()]).basic_auth("admin", "short").router() {
+        Err(Error::Config(message)) => assert!(message.contains("at least 8 characters"), "{message}"),
+        Err(error) => panic!("unexpected error: {error}"),
+        Ok(_) => panic!("a short dashboard password built a router"),
+    }
 }
 
 /// HTTP Basic joins the credential with a colon, and `basic_credentials_match`
@@ -904,7 +914,7 @@ async fn test_dashboard_refuses_a_basic_auth_username_containing_a_colon(pool: P
 #[sqlx::test(migrations = "./migrations")]
 async fn test_health_endpoint_bypasses_dashboard_auth(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
 
     let (status, body) = get_json(&router, "/health").await;
     assert_eq!(status, StatusCode::OK);
@@ -917,7 +927,7 @@ async fn test_health_endpoint_bypasses_dashboard_auth(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn test_browser_auth_supports_password_changes_and_logout(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
 
     let response = router
         .clone()
@@ -939,7 +949,7 @@ async fn test_browser_auth_supports_password_changes_and_logout(pool: PgPool) {
                 .method("POST")
                 .uri("/login")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::from("username=admin&password=s3cret"))
+                .body(Body::from("username=admin&password=s3cretpw"))
                 .unwrap(),
         )
         .await
@@ -966,7 +976,7 @@ async fn test_browser_auth_supports_password_changes_and_logout(pool: PgPool) {
                 .header(header::COOKIE, &cookie)
                 .header("x-ironqueue-request", "dashboard")
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"current_password":"s3cret","new_password":"newsecret"}"#))
+                .body(Body::from(r#"{"current_password":"s3cretpw","new_password":"newsecret"}"#))
                 .unwrap(),
         )
         .await
@@ -996,7 +1006,7 @@ async fn test_browser_auth_supports_password_changes_and_logout(pool: PgPool) {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{stale}");
     }
 
-    let (status, _) = request(&router, "GET", "/api/queues", Some("Basic YWRtaW46czNjcmV0")).await;
+    let (status, _) = request(&router, "GET", "/api/queues", Some("Basic YWRtaW46czNjcmV0cHc=")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let (status, _) = request(&router, "GET", "/api/queues", Some("Basic YWRtaW46bmV3c2VjcmV0")).await;
     assert_eq!(status, StatusCode::OK);
@@ -1036,7 +1046,7 @@ async fn test_browser_auth_supports_password_changes_and_logout(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn test_browser_auth_reads_a_session_cookie_from_any_cookie_header(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
     let cookie = login_cookie(&router).await;
 
     let split_cookies = |request: axum::http::request::Builder| {
@@ -1079,7 +1089,7 @@ async fn test_browser_auth_reads_a_session_cookie_from_any_cookie_header(pool: P
 #[sqlx::test(migrations = "./migrations")]
 async fn test_password_change_rotates_the_callers_session_token(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
     let cookie = login_cookie(&router).await;
 
     let response = router
@@ -1091,7 +1101,7 @@ async fn test_password_change_rotates_the_callers_session_token(pool: PgPool) {
                 .header(header::COOKIE, &cookie)
                 .header("x-ironqueue-request", "dashboard")
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"current_password":"s3cret","new_password":"newsecret"}"#))
+                .body(Body::from(r#"{"current_password":"s3cretpw","new_password":"newsecret"}"#))
                 .unwrap(),
         )
         .await
@@ -1133,7 +1143,7 @@ async fn test_password_change_rotates_the_callers_session_token(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn test_browser_auth_can_opt_out_of_secure_cookies_for_direct_http(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").secure_cookies(false).router().unwrap();
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").secure_cookies(false).router().unwrap();
 
     let response = router
         .oneshot(
@@ -1141,7 +1151,7 @@ async fn test_browser_auth_can_opt_out_of_secure_cookies_for_direct_http(pool: P
                 .method("POST")
                 .uri("/login")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::from("username=admin&password=s3cret"))
+                .body(Body::from("username=admin&password=s3cretpw"))
                 .unwrap(),
         )
         .await
@@ -1155,7 +1165,7 @@ async fn test_browser_auth_can_opt_out_of_secure_cookies_for_direct_http(pool: P
 #[sqlx::test(migrations = "./migrations")]
 async fn test_authentication_failure_waits_before_rejecting_supplied_credentials(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
 
     let started = tokio::time::Instant::now();
     let response = router
@@ -1182,7 +1192,7 @@ async fn test_authentication_failure_waits_before_rejecting_supplied_credentials
 #[sqlx::test(migrations = "./migrations")]
 async fn test_valid_basic_credentials_are_accepted_when_failed_comparison_is_in_flight(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
 
     let invalid = router.clone().oneshot(
         Request::builder()
@@ -1194,7 +1204,7 @@ async fn test_valid_basic_credentials_are_accepted_when_failed_comparison_is_in_
     let valid = router.clone().oneshot(
         Request::builder()
             .uri("/api/queues")
-            .header(header::AUTHORIZATION, "Basic YWRtaW46czNjcmV0")
+            .header(header::AUTHORIZATION, "Basic YWRtaW46czNjcmV0cHc=")
             .body(Body::empty())
             .unwrap(),
     );
@@ -1208,14 +1218,14 @@ async fn test_valid_basic_credentials_are_accepted_when_failed_comparison_is_in_
     let valid = valid.unwrap();
     assert_eq!(valid.status(), StatusCode::OK);
 
-    let (status, _) = request(&router, "GET", "/api/queues", Some("Basic YWRtaW46czNjcmV0")).await;
+    let (status, _) = request(&router, "GET", "/api/queues", Some("Basic YWRtaW46czNjcmV0cHc=")).await;
     assert_eq!(status, StatusCode::OK);
 }
 
 #[sqlx::test(migrations = "./migrations")]
 async fn test_authentication_attempts_are_refused_when_the_attempt_budget_is_spent(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
 
     let invalid_request = || {
         let router = router.clone();
@@ -1270,7 +1280,7 @@ async fn test_authentication_attempts_are_refused_when_the_attempt_budget_is_spe
 #[sqlx::test(migrations = "./migrations")]
 async fn test_password_change_throttles_wrong_current_password_and_accepts_correct(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
     let cookie = login_cookie(&router).await;
 
     let started = tokio::time::Instant::now();
@@ -1299,7 +1309,7 @@ async fn test_password_change_throttles_wrong_current_password_and_accepts_corre
                 .header(header::COOKIE, cookie)
                 .header("x-ironqueue-request", "dashboard")
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"current_password":"s3cret","new_password":"newsecret"}"#))
+                .body(Body::from(r#"{"current_password":"s3cretpw","new_password":"newsecret"}"#))
                 .unwrap(),
         )
         .await
@@ -1310,8 +1320,8 @@ async fn test_password_change_throttles_wrong_current_password_and_accepts_corre
 #[sqlx::test(migrations = "./migrations")]
 async fn test_browser_auth_namespaces_session_cookies_per_dashboard(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    let first = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
-    let second = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let first = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
+    let second = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
 
     let first_cookie = login_cookie(&first).await;
     let second_cookie = login_cookie(&second).await;
@@ -1337,7 +1347,7 @@ async fn test_browser_auth_namespaces_session_cookies_per_dashboard(pool: PgPool
 #[sqlx::test(migrations = "./migrations")]
 async fn test_browser_auth_scopes_session_cookie_to_mount_path(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    let router = dashboard([db.queue.clone()]).mount_path("/admin").basic_auth("admin", "s3cret").router().unwrap();
+    let router = dashboard([db.queue.clone()]).mount_path("/admin").basic_auth("admin", "s3cretpw").router().unwrap();
 
     let response = router
         .clone()
@@ -1346,7 +1356,7 @@ async fn test_browser_auth_scopes_session_cookie_to_mount_path(pool: PgPool) {
                 .method("POST")
                 .uri("/login")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::from("username=admin&password=s3cret"))
+                .body(Body::from("username=admin&password=s3cretpw"))
                 .unwrap(),
         )
         .await
@@ -1441,6 +1451,30 @@ async fn test_spa_shell_and_static_files_are_served(pool: PgPool) {
     assert_eq!(response.headers().get(header::STRICT_TRANSPORT_SECURITY).unwrap(), "max-age=31536000");
 }
 
+#[sqlx::test(migrations = "./migrations")]
+async fn test_embedded_router_rejects_ambiguous_request_framing(pool: PgPool) {
+    let db = TestDb::new(pool.clone()).await;
+    let router = dashboard([db.queue.clone()]).router().unwrap();
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/queues")
+                .header(header::CONTENT_LENGTH, "4")
+                .header(header::TRANSFER_ENCODING, "chunked")
+                .body(Body::from("0\r\n\r\n"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.headers().get(header::CONNECTION).unwrap(), "close");
+    assert!(response.headers().contains_key(header::CONTENT_SECURITY_POLICY));
+    assert_eq!(response.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+    assert_eq!(response.headers().get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+}
+
 /// The counterpart: HSTS must not be sent by a mount that serves plain HTTP,
 /// where it would pin a scheme the deployment does not answer on.
 #[sqlx::test(migrations = "./migrations")]
@@ -1462,7 +1496,7 @@ async fn test_dashboard_omits_hsts_when_cookies_are_not_secure(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn test_static_route_serves_only_the_public_file_allowlist(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
 
     // Authentication really is on, so these are anonymous requests.
     for guarded in ["/api/queues", "/api/account/password", "/"] {
@@ -1608,7 +1642,7 @@ async fn test_broken_database_yields_500s(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn test_standalone_dashboard_runs_until_cancelled(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    let dashboard = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").serve_on("localhost", 0);
+    let dashboard = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").serve_on("localhost", 0);
     let mut dashboard_handle = dashboard.server_handle();
     let shutdown = CancellationToken::new();
     let run = tokio::spawn(dashboard.run_until(shutdown.clone()));
@@ -1618,7 +1652,7 @@ async fn test_standalone_dashboard_runs_until_cancelled(pool: PgPool) {
 
     let response = http_get(address, "/api/queues", None).await;
     assert!(response.starts_with("HTTP/1.1 401"), "{response}");
-    let response = http_get(address, "/api/queues", Some("Basic YWRtaW46czNjcmV0")).await;
+    let response = http_get(address, "/api/queues", Some("Basic YWRtaW46czNjcmV0cHc=")).await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert!(response.contains("\"name\":\"default\""), "{response}");
 
@@ -1923,7 +1957,7 @@ async fn test_standalone_dashboard_reports_bind_failure(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn test_worker_hosts_authenticated_dashboard_and_stops_it_on_shutdown(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    let dashboard = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").serve_on("127.0.0.1", 0);
+    let dashboard = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").serve_on("127.0.0.1", 0);
     let mut dashboard_handle = dashboard.server_handle();
     let worker = Worker::builder(db.queue.clone()).register_job(dashboard_probe).dashboard(dashboard).build().unwrap();
     let worker_id = worker.id();
@@ -1936,10 +1970,10 @@ async fn test_worker_hosts_authenticated_dashboard_and_stops_it_on_shutdown(pool
     let response = http_get(address, "/api/queues", None).await;
     assert!(response.starts_with("HTTP/1.1 401"), "{response}");
 
-    let response = http_get(address, "/api/queues", Some("Basic YWRtaW46czNjcmV0")).await;
+    let response = http_get(address, "/api/queues", Some("Basic YWRtaW46czNjcmV0cHc=")).await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert!(response.contains("\"name\":\"default\""), "{response}");
-    let response = http_get(address, "/api/queues/default/workers", Some("Basic YWRtaW46czNjcmV0")).await;
+    let response = http_get(address, "/api/queues/default/workers", Some("Basic YWRtaW46czNjcmV0cHc=")).await;
     assert!(response.contains(&worker_id.to_string()), "{response}");
 
     shutdown.cancel();
@@ -2735,8 +2769,8 @@ async fn test_every_state_changing_route_refuses_a_request_without_the_action_he
     // are only mounted when it is, and `require_auth` runs ahead of the guard, so
     // an anonymous request would be answered 404 or 401 and prove nothing about
     // the header check.
-    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
-    let credential = "Basic YWRtaW46czNjcmV0";
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
+    let credential = "Basic YWRtaW46czNjcmV0cHc=";
 
     // Bodies that *extract*, so the guard is what refuses them. Axum runs the
     // `Json` extractor before the handler, so a malformed body is answered 422
@@ -2744,7 +2778,7 @@ async fn test_every_state_changing_route_refuses_a_request_without_the_action_he
     for (path, body) in [
         (format!("/api/queues/default/jobs/{id}/abort"), "{}"),
         (format!("/api/queues/default/jobs/{id}/retry"), "{}"),
-        ("/api/account/password".to_string(), r#"{"current_password":"s3cret","new_password":"a-new-password"}"#),
+        ("/api/account/password".to_string(), r#"{"current_password":"s3cretpw","new_password":"a-new-password"}"#),
         ("/api/account/logout".to_string(), "{}"),
     ] {
         let response = router
@@ -3277,7 +3311,7 @@ fn cookie_max_age(response: &Response) -> u64 {
 #[sqlx::test(migrations = "./migrations")]
 async fn test_rotated_session_cookie_expires_when_the_replaced_session_would_have(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
 
     let login = router
         .clone()
@@ -3286,7 +3320,7 @@ async fn test_rotated_session_cookie_expires_when_the_replaced_session_would_hav
                 .method("POST")
                 .uri("/login")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::from("username=admin&password=s3cret"))
+                .body(Body::from("username=admin&password=s3cretpw"))
                 .unwrap(),
         )
         .await
@@ -3303,7 +3337,7 @@ async fn test_rotated_session_cookie_expires_when_the_replaced_session_would_hav
                 .header(header::COOKIE, &cookie)
                 .header("x-ironqueue-request", "dashboard")
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"current_password":"s3cret","new_password":"newsecret"}"#))
+                .body(Body::from(r#"{"current_password":"s3cretpw","new_password":"newsecret"}"#))
                 .unwrap(),
         )
         .await
@@ -3391,7 +3425,7 @@ async fn dashboard_login_from_site(
 #[sqlx::test(migrations = "./migrations")]
 async fn test_dashboard_login_refuses_a_cross_site_post_before_spending_the_budget(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
 
     let mut flood = tokio::task::JoinSet::new();
     for attempt in 0..64 {
@@ -3409,7 +3443,7 @@ async fn test_dashboard_login_refuses_a_cross_site_post_before_spending_the_budg
     // The operator's own address — the one the flood is charged to, if it is
     // charged to anything — while the flood is still in flight, because a
     // budget spent and refilled by the time they arrive is no lockout.
-    let login = dashboard_login_from(&router, Some(dashboard_peer(1)), "s3cret").await;
+    let login = dashboard_login_from(&router, Some(dashboard_peer(1)), "s3cretpw").await;
     assert_eq!(
         login.status(),
         StatusCode::SEE_OTHER,
@@ -3433,18 +3467,18 @@ async fn test_dashboard_login_refuses_a_cross_site_post_before_spending_the_budg
 #[sqlx::test(migrations = "./migrations")]
 async fn test_dashboard_login_accepts_every_post_a_browser_calls_its_own(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
 
     for site in ["same-origin", "none"] {
-        let login = dashboard_login_from_site(&router, None, site, "s3cret").await;
+        let login = dashboard_login_from_site(&router, None, site, "s3cretpw").await;
         assert_eq!(login.status(), StatusCode::SEE_OTHER, "a {site} login must be accepted");
     }
     assert_eq!(
-        dashboard_login(&router, "s3cret").await.status(),
+        dashboard_login(&router, "s3cretpw").await.status(),
         StatusCode::SEE_OTHER,
         "a client that sends no Sec-Fetch-Site must be accepted"
     );
-    let refused = dashboard_login_from_site(&router, None, "same-site", "s3cret").await;
+    let refused = dashboard_login_from_site(&router, None, "same-site", "s3cretpw").await;
     assert_eq!(refused.status(), StatusCode::FORBIDDEN);
     assert!(
         String::from_utf8(axum::body::to_bytes(refused.into_body(), usize::MAX).await.unwrap().to_vec())
@@ -3485,14 +3519,14 @@ async fn dashboard_login_with_origin(
 #[sqlx::test(migrations = "./migrations")]
 async fn test_dashboard_login_refuses_a_mismatched_origin_without_fetch_metadata(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
 
     for (origin, host) in [
         (Some("https://evil.example"), Some("dash.example")),
         (Some("null"), Some("dash.example")),
         (Some("https://dash.example:8443"), Some("dash.example")),
     ] {
-        let refused = dashboard_login_with_origin(&router, origin, host, "s3cret").await;
+        let refused = dashboard_login_with_origin(&router, origin, host, "s3cretpw").await;
         assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{origin:?} against {host:?} must be refused");
     }
 
@@ -3503,7 +3537,7 @@ async fn test_dashboard_login_refuses_a_mismatched_origin_without_fetch_metadata
         // No Origin at all is a non-browser client, whatever the Host says.
         (None, Some("dash.example")),
     ] {
-        let accepted = dashboard_login_with_origin(&router, origin, host, "s3cret").await;
+        let accepted = dashboard_login_with_origin(&router, origin, host, "s3cretpw").await;
         assert_eq!(accepted.status(), StatusCode::SEE_OTHER, "{origin:?} against {host:?} must be accepted");
     }
 
@@ -3519,7 +3553,7 @@ async fn test_dashboard_login_refuses_a_mismatched_origin_without_fetch_metadata
     request = request.extension(dashboard_peer(3));
     let response = router
         .clone()
-        .oneshot(request.body(Body::from("username=admin&password=s3cret".to_string())).unwrap())
+        .oneshot(request.body(Body::from("username=admin&password=s3cretpw".to_string())).unwrap())
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
@@ -3542,9 +3576,9 @@ async fn dashboard_basic_guess(router: &Router, peer: Option<ConnectInfo<SocketA
 #[sqlx::test(migrations = "./migrations")]
 async fn test_session_cookie_is_read_past_an_empty_cookie_of_the_same_name(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
 
-    let login = dashboard_login(&router, "s3cret").await;
+    let login = dashboard_login(&router, "s3cretpw").await;
     assert_eq!(login.status(), StatusCode::SEE_OTHER);
     let cookie = login.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_string();
     let (name, _) = cookie.split_once('=').expect("a name=value cookie");
@@ -3586,7 +3620,7 @@ async fn test_a_planted_cookie_of_the_same_name_cannot_hide_the_session(pool: Pg
     // cookie is reachable at all.
     let router = Router::new().nest(
         "/admin",
-        dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").mount_path("/admin").router().unwrap(),
+        dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").mount_path("/admin").router().unwrap(),
     );
 
     let login = router
@@ -3596,7 +3630,7 @@ async fn test_a_planted_cookie_of_the_same_name_cannot_hide_the_session(pool: Pg
                 .method("POST")
                 .uri("/admin/login")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::from("username=admin&password=s3cret"))
+                .body(Body::from("username=admin&password=s3cretpw"))
                 .unwrap(),
         )
         .await
@@ -3676,7 +3710,7 @@ async fn dashboard_change_password(router: &Router, cookie: &str, current: &str,
 async fn test_dashboard_limits_credential_request_bodies(pool: PgPool) {
     const OVERSIZED_CREDENTIAL_BYTES: usize = 8 * 1024;
     let db = TestDb::new(pool.clone()).await;
-    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
     let oversized_form = format!("username=admin&password={}", "x".repeat(OVERSIZED_CREDENTIAL_BYTES));
 
     // More than one full authentication burst, all from one client. If extraction reaches the handler, these requests
@@ -3704,12 +3738,12 @@ async fn test_dashboard_limits_credential_request_bodies(pool: PgPool) {
         assert_eq!(response.unwrap().status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    let login = dashboard_login_from(&router, Some(dashboard_peer(1)), "s3cret").await;
+    let login = dashboard_login_from(&router, Some(dashboard_peer(1)), "s3cretpw").await;
     assert_eq!(login.status(), StatusCode::SEE_OTHER, "oversized bodies spent the login budget");
     let cookie = login.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_string();
 
     let oversized_change = json!({
-        "current_password": "s3cret",
+        "current_password": "s3cretpw",
         "new_password": "x".repeat(OVERSIZED_CREDENTIAL_BYTES),
     });
     let response = router
@@ -3728,7 +3762,7 @@ async fn test_dashboard_limits_credential_request_bodies(pool: PgPool) {
         .unwrap();
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
-    let response = dashboard_change_password(&router, &cookie, "s3cret", "replacement").await;
+    let response = dashboard_change_password(&router, &cookie, "s3cretpw", "replacement").await;
     assert_eq!(response.status(), StatusCode::OK, "the body limit refused an ordinary password change");
 }
 
@@ -3739,8 +3773,8 @@ async fn test_dashboard_limits_credential_request_bodies(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn test_dashboard_password_minimum_counts_characters_not_bytes(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
-    let cookie = dashboard_login(&router, "s3cret").await.headers()[header::SET_COOKIE]
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
+    let cookie = dashboard_login(&router, "s3cretpw").await.headers()[header::SET_COOKIE]
         .to_str()
         .unwrap()
         .split(';')
@@ -3748,7 +3782,7 @@ async fn test_dashboard_password_minimum_counts_characters_not_bytes(pool: PgPoo
         .unwrap()
         .to_string();
 
-    let response = dashboard_change_password(&router, &cookie, "s3cret", "éééé").await;
+    let response = dashboard_change_password(&router, &cookie, "s3cretpw", "éééé").await;
     assert_eq!(
         response.status(),
         StatusCode::BAD_REQUEST,
@@ -3758,7 +3792,7 @@ async fn test_dashboard_password_minimum_counts_characters_not_bytes(pool: PgPoo
     // Not a refusal of non-ASCII, and proof the account is untouched: the same
     // alphabet at the stated length is accepted, on the current password the
     // refused change would have replaced.
-    let response = dashboard_change_password(&router, &cookie, "s3cret", "ééééééée").await;
+    let response = dashboard_change_password(&router, &cookie, "s3cretpw", "ééééééée").await;
     assert_eq!(response.status(), StatusCode::OK);
 }
 
@@ -3772,7 +3806,7 @@ async fn test_dashboard_password_minimum_counts_characters_not_bytes(pool: PgPoo
 #[sqlx::test(migrations = "./migrations")]
 async fn test_dashboard_refuses_a_correct_password_while_guesses_have_the_budget_spent(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
 
     let mut guesses = tokio::task::JoinSet::new();
     for attempt in 0..64 {
@@ -3787,7 +3821,7 @@ async fn test_dashboard_refuses_a_correct_password_while_guesses_have_the_budget
         tokio::task::yield_now().await;
     }
 
-    let correct = dashboard_login(&router, "s3cret").await;
+    let correct = dashboard_login(&router, "s3cretpw").await;
     assert_eq!(
         correct.status(),
         StatusCode::TOO_MANY_REQUESTS,
@@ -3812,7 +3846,7 @@ async fn test_dashboard_refuses_a_correct_password_while_guesses_have_the_budget
         Duration::from_millis(50),
         "the account never recovered after the guessing stopped",
         || async {
-            let response = dashboard_login(&router, "s3cret").await;
+            let response = dashboard_login(&router, "s3cretpw").await;
             (response.status() == StatusCode::SEE_OTHER).then_some(())
         },
     );
@@ -3828,7 +3862,7 @@ async fn test_dashboard_refuses_a_correct_password_while_guesses_have_the_budget
 #[sqlx::test(migrations = "./migrations")]
 async fn test_dashboard_login_survives_a_guessing_flood_from_another_client(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
 
     // Same endpoint, same channel, different client: only the address tells the
     // attacker's guesses apart from the operator's login.
@@ -3843,7 +3877,7 @@ async fn test_dashboard_login_survives_a_guessing_flood_from_another_client(pool
         tokio::task::yield_now().await;
     }
 
-    let login = dashboard_login_from(&router, Some(dashboard_peer(2)), "s3cret").await;
+    let login = dashboard_login_from(&router, Some(dashboard_peer(2)), "s3cretpw").await;
     assert_eq!(
         login.status(),
         StatusCode::SEE_OTHER,
@@ -3867,7 +3901,7 @@ async fn test_dashboard_login_survives_a_guessing_flood_from_another_client(pool
 #[sqlx::test(migrations = "./migrations")]
 async fn test_dashboard_login_survives_a_basic_auth_flood_from_an_indistinguishable_client(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
 
     let mut flood = tokio::task::JoinSet::new();
     for _ in 0..64 {
@@ -3878,7 +3912,7 @@ async fn test_dashboard_login_survives_a_basic_auth_flood_from_an_indistinguisha
         tokio::task::yield_now().await;
     }
 
-    let login = dashboard_login(&router, "s3cret").await;
+    let login = dashboard_login(&router, "s3cretpw").await;
     assert_eq!(login.status(), StatusCode::SEE_OTHER, "API guessing must not spend the login form's budget");
 
     let mut refused = 0;
@@ -3931,7 +3965,8 @@ async fn test_served_dashboard_charges_a_guess_to_the_client_that_made_it(pool: 
         return;
     };
 
-    let dashboard = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").secure_cookies(false).serve_on("::", 0);
+    let dashboard =
+        dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").secure_cookies(false).serve_on("::", 0);
     let mut handle = dashboard.server_handle();
     let shutdown = CancellationToken::new();
     let server = tokio::spawn(dashboard.run_until(shutdown.clone()));
@@ -3970,7 +4005,7 @@ async fn test_served_dashboard_charges_a_guess_to_the_client_that_made_it(pool: 
     // by it, so every one of these succeeds rather than winning a share of a
     // budget the flood keeps at zero.
     for attempt in 0..10 {
-        let response = http_login(operator, "s3cret").await;
+        let response = http_login(operator, "s3cretpw").await;
         assert!(
             response.starts_with("HTTP/1.1 303"),
             "attempt {attempt} was locked out by another client's flood: {response}"
@@ -4001,7 +4036,7 @@ async fn dual_stack_loopback_available() -> Option<()> {
 #[sqlx::test(migrations = "./migrations")]
 async fn test_dashboard_login_form_renders_the_login_page_when_the_budget_is_spent(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
 
     let mut guesses = tokio::task::JoinSet::new();
     for attempt in 0..64 {
@@ -4102,10 +4137,10 @@ async fn test_dashboard_login_survives_a_proxied_flood_when_a_trusted_proxy_hop_
 
     // The default ignores the header, which behind a proxy is one bucket for
     // the whole internet: the operator is locked out by somebody else's flood.
-    let shared = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let shared = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
     let flood = dashboard_forwarded_flood(&shared, proxy, |_| attacker.to_string()).await;
     assert_eq!(
-        dashboard_login_forwarded(&shared, proxy, operator, "s3cret").await.status(),
+        dashboard_login_forwarded(&shared, proxy, operator, "s3cretpw").await.status(),
         StatusCode::TOO_MANY_REQUESTS,
         "keying by peer alone cannot tell two clients behind one proxy apart"
     );
@@ -4113,9 +4148,9 @@ async fn test_dashboard_login_survives_a_proxied_flood_when_a_trusted_proxy_hop_
 
     // Trusting exactly the proxies that are there makes the flood cost the
     // flooder and nobody else.
-    let proxied = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").trusted_proxy_hops(1).router().unwrap();
+    let proxied = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").trusted_proxy_hops(1).router().unwrap();
     let flood = dashboard_forwarded_flood(&proxied, proxy, |_| attacker.to_string()).await;
-    let login = dashboard_login_forwarded(&proxied, proxy, operator, "s3cret").await;
+    let login = dashboard_login_forwarded(&proxied, proxy, operator, "s3cretpw").await;
     assert_eq!(
         login.status(),
         StatusCode::SEE_OTHER,
@@ -4136,13 +4171,13 @@ async fn test_dashboard_trusted_proxy_hops_ignore_forwarded_entries_a_client_for
     let db = TestDb::new(pool.clone()).await;
     let proxy = dashboard_peer(1);
 
-    let one_hop = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").trusted_proxy_hops(1).router().unwrap();
+    let one_hop = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").trusted_proxy_hops(1).router().unwrap();
     // Every guess claims a different origin, and the proxy appends the one real
     // address behind them all.
     let flood =
         dashboard_forwarded_flood(&one_hop, proxy, |attempt| format!("192.0.2.{}, 203.0.113.5", attempt % 256)).await;
     assert_eq!(
-        dashboard_login_forwarded(&one_hop, proxy, "198.51.100.9", "s3cret").await.status(),
+        dashboard_login_forwarded(&one_hop, proxy, "198.51.100.9", "s3cretpw").await.status(),
         StatusCode::SEE_OTHER,
         "the flood must stay charged to the client the proxy observed"
     );
@@ -4150,10 +4185,11 @@ async fn test_dashboard_trusted_proxy_hops_ignore_forwarded_entries_a_client_for
 
     // Two proxies configured, one entry supplied: the chain never crossed them,
     // so it names nobody and the peer pays.
-    let two_hops = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").trusted_proxy_hops(2).router().unwrap();
+    let two_hops =
+        dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").trusted_proxy_hops(2).router().unwrap();
     let flood = dashboard_forwarded_flood(&two_hops, proxy, |attempt| format!("192.0.2.{}", attempt % 256)).await;
     assert_eq!(
-        dashboard_login_forwarded(&two_hops, dashboard_peer(2), "192.0.2.1", "s3cret").await.status(),
+        dashboard_login_forwarded(&two_hops, dashboard_peer(2), "192.0.2.1", "s3cretpw").await.status(),
         StatusCode::SEE_OTHER,
         "a different peer must keep its own budget"
     );
@@ -4326,7 +4362,7 @@ async fn test_building_a_dashboard_without_authentication_warns(pool: PgPool) {
         1,
         "an unauthenticated dashboard must announce itself"
     );
-    let _ = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let _ = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
     assert_eq!(recorded.matching("without authentication").len(), 1, "a protected dashboard has nothing to warn about");
     drop(guard);
 }
@@ -4341,7 +4377,7 @@ async fn test_building_a_dashboard_without_authentication_warns(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn test_unkeyed_authentication_throttle_warns_once(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
-    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cret").router().unwrap();
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
 
     let (recorded, guard) = record_messages();
     for _ in 0..3 {

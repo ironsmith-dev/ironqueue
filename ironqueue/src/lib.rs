@@ -71,8 +71,9 @@ pub enum Error {
 
     /// A dashboard could not bind, its server task panicked, or its
     /// authentication state was unavailable.
+    #[cfg(feature = "dashboard")]
     #[error("dashboard server error: {0}")]
-    Dashboard(std::io::Error),
+    Dashboard(#[source] std::io::Error),
 
     /// The job does not exist (deleted, expired, or never enqueued).
     #[error("job not found: {0}")]
@@ -92,6 +93,7 @@ pub enum Error {
     WaitTimeout,
 }
 
+#[cfg(feature = "dashboard")]
 mod dashboard;
 mod database;
 mod job;
@@ -99,6 +101,7 @@ mod queue;
 mod sweeper;
 mod worker;
 
+#[cfg(feature = "dashboard")]
 pub use dashboard::{Dashboard, DashboardServer, DashboardServerHandle};
 
 /// The untyped job template behind [`Queue::enqueue_raw`]. Test-only, as that
