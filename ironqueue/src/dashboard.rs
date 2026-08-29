@@ -4041,7 +4041,7 @@ pub(crate) const JOB_NAME_TYPEAHEAD_SQL: &str = r#"
 ///
 /// [`JOB_PAGE_BY_NAME_SQL`] already planned that nested loop and still does; it
 /// got there because its keys estimate happened to land lower, which is luck.
-/// This makes it construction, for both.
+/// This makes it so by construction for both.
 macro_rules! job_page_sql {
     ($keys:literal, $limit:literal) => {
         concat!(

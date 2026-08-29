@@ -92,10 +92,9 @@ impl SweeperReport {
 ///
 /// The `Default` value is [`SweepOperations::NONE`], not `ALL` — it exists so
 /// [`SweeperReport`] can derive `Default`. Handing it to
-/// [`Sweeper::sweep_operations`] is not a full sweep: leadership is acquired
-/// first, so the pass takes the queue's sweep lock away from every other
-/// process for this [`Sweeper`]'s lifetime and then performs no operation at
-/// all, reporting `leader: true` with no more work.
+/// [`Sweeper::sweep_operations`] is a no-op that does not acquire leadership.
+/// A [`Sweeper`] that already holds leadership keeps it and reports
+/// `leader: true` with no more work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SweepOperations {
     /// Purge expired terminal job rows.
@@ -156,7 +155,7 @@ pub(crate) fn is_swept_marked(error: Option<&str>, result: Option<&Value>) -> bo
 /// a `select!` on a shutdown token does — leaves this process either holding
 /// leadership on a connection it can still name, or holding nothing at all.
 ///
-/// A recovered attempt that has attempts left is requeued; one that does not
+/// A recovered attempt that has attempts left is requeued; one with none left
 /// finishes **`aborted`**, with `error = "swept"` — not `failed`. Nothing here
 /// ever saw a handler report an error, which is what `failed` means everywhere
 /// else, so a job lost to a crashed worker on its last attempt shows up in
@@ -241,6 +240,9 @@ impl Sweeper {
     }
 
     async fn sweep_pass(&mut self, operations: SweepOperations) -> Result<SweeperReport, Error> {
+        if !operations.any() {
+            return Ok(SweeperReport { leader: self.is_leader(), ..SweeperReport::default() });
+        }
         if !self.ensure_leadership().await? {
             return Ok(SweeperReport::default());
         }

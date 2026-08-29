@@ -34,6 +34,7 @@ See [README.md](README.md).
 
 ### Git
 
+- Before drafting a commit message, review recent messages with `git log` and match their writing style.
 - Use a single-line, imperative commit subject without a trailing period.
 - After a blank line, use a flat bullet-point list of short sentences describing the change.
 - Never commit or push unless explicitly asked.

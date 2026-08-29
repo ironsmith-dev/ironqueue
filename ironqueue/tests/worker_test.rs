@@ -1237,6 +1237,28 @@ async fn count_jobs_named(db: &TestDb, name: &str) -> i64 {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn test_sweep_operations_none_does_not_acquire_leadership(pool: PgPool) {
+    let db = TestDb::new(pool).await;
+    let mut idle = db.queue.sweeper();
+
+    let idle_report = idle.sweep_operations(ironqueue::SweepOperations::NONE).await.unwrap();
+    assert!(!idle_report.leader);
+    assert!(!idle_report.has_more_work());
+
+    let mut leader = db.queue.sweeper();
+    let leader_report = leader.sweep().await.unwrap();
+    assert!(leader_report.leader, "the no-op pass must leave leadership available");
+
+    let retained_report = leader.sweep_operations(ironqueue::SweepOperations::NONE).await.unwrap();
+    assert!(retained_report.leader, "a no-op pass must not release leadership already held");
+    assert!(!retained_report.has_more_work());
+
+    let idle_report = idle.sweep_operations(ironqueue::SweepOperations::NONE).await.unwrap();
+    assert!(!idle_report.leader, "a no-op pass must not contend with the existing leader");
+    leader.release().await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn test_sweep_reports_only_the_operations_that_filled_their_batch(pool: PgPool) {
     let db = TestDb::with(pool.clone(), |builder| builder.sweep_batch_size(1)).await;
     insert_expired_jobs(&db, 2).await;

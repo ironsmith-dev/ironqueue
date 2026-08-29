@@ -26,7 +26,10 @@ jobs:
       - name: Install dev tools
         uses: taiki-e/install-action@288e746965032cfcc232e09af2daf5f23c14d780 # v2.86.1
         with:
-          tool: cargo-llvm-cov@0.8.7,prek@0.4.13,sqlx-cli@0.9.0
+          tool: cargo-audit@0.22.2,cargo-llvm-cov@0.8.7,prek@0.4.13,sqlx-cli@0.9.0
+
+      - name: Audit dependencies
+        run: cargo audit --deny yanked
 
       - name: Run pre-commit hooks
         run: prek run --all-files

@@ -58,7 +58,7 @@ pub enum Error {
     DedupeRace(String),
 
     /// An internal asynchronous task panicked or was cancelled.
-    #[error("task error: {0}")]
+    #[error(transparent)]
     Task(#[from] tokio::task::JoinError),
 
     /// A worker infrastructure task stopped unexpectedly, could not stop
@@ -72,8 +72,8 @@ pub enum Error {
     /// A dashboard could not bind, its server task panicked, or its
     /// authentication state was unavailable.
     #[cfg(feature = "dashboard")]
-    #[error("dashboard server error: {0}")]
-    Dashboard(#[source] std::io::Error),
+    #[error(transparent)]
+    Dashboard(std::io::Error),
 
     /// The job does not exist (deleted, expired, or never enqueued).
     #[error("job not found: {0}")]
@@ -85,7 +85,7 @@ pub enum Error {
     ResultExpired(Uuid),
 
     /// A job waited on via `enqueue_and_wait` or `wait` finished unsuccessfully.
-    #[error("job failed: {0}")]
+    #[error(transparent)]
     Job(#[from] JobError),
 
     /// Waiting for a job result exceeded the caller's deadline.
@@ -560,7 +560,30 @@ pub mod __test_support {
 
 #[cfg(test)]
 mod tests {
-    use crate::JobErrorKind;
+    use crate::{Error, JobError, JobErrorKind};
+
+    fn assert_error_renders_source_once(error: Error, expected: &str) {
+        let error = anyhow::Error::new(error);
+        assert_eq!(error.to_string(), expected);
+        assert_eq!(format!("{error:#}"), expected);
+    }
+
+    #[tokio::test]
+    async fn test_sourced_error_variants_render_their_cause_once() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        task.abort();
+        let task_error = task.await.unwrap_err();
+        let task_message = task_error.to_string();
+        assert_error_renders_source_once(Error::Task(task_error), &task_message);
+
+        #[cfg(feature = "dashboard")]
+        assert_error_renders_source_once(Error::Dashboard(std::io::Error::other("socket closed")), "socket closed");
+
+        assert_error_renders_source_once(
+            Error::Job(JobError::new(JobErrorKind::Failed, "handler failed")),
+            "failed: handler failed",
+        );
+    }
 
     #[test]
     fn test_private_helpers_round_trip_and_surface_errors() {
