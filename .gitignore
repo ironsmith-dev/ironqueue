@@ -23,10 +23,15 @@ lcov.info
 playwright-report/
 test-results/
 
-# agents: machine-local state only, so shared settings and agents stay committable
+# agents
 **/.claude/settings.local.json
 .claude/scheduled_tasks.lock
 .claude/worktrees/
+
+# agent planning
+plan.html
+TODO.md
+todo.md
 
 # environment: `DATABASE_URL` lives here, and sqlx-cli loads `.env` on its own
 .direnv/

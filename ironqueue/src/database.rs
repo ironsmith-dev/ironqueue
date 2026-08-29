@@ -2981,12 +2981,13 @@ impl Database {
     /// when no attempts remain or an abort landed meanwhile; every transition
     /// carries the standard guards, so a row that already moved on is left
     /// alone.
-    pub(crate) fn spawn_dropped_attempt_recovery(&self, row: &JobRow) {
+    pub(crate) fn spawn_dropped_attempt_recovery(&self, row: &JobRow, runtime: Option<tokio::runtime::Handle>) {
         spawn_dropped_attempt_resolver(
             self.recovery_context(),
             row.worker_id,
             duration_to_ms(row.next_retry_delay()),
             DatabaseUnacknowledgedClaim { id: row.id, attempts: row.attempts },
+            runtime,
         );
     }
 }
@@ -3055,6 +3056,7 @@ fn spawn_dropped_attempt_resolver(
     worker_id: Option<Uuid>,
     retry_delay_ms: i64,
     claim: DatabaseUnacknowledgedClaim,
+    fallback_runtime: Option<tokio::runtime::Handle>,
 ) {
     const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(100);
     const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -3064,11 +3066,11 @@ fn spawn_dropped_attempt_resolver(
         attempt = claim.attempts,
         "attempt dropped without settlement; recovering it in the background"
     );
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+    let Some(runtime) = tokio::runtime::Handle::try_current().ok().or(fallback_runtime) else {
         tracing::warn!(
             queue = %context.queue,
             job.id = %claim.id,
-            "no runtime to recover a dropped attempt on; lease expiry will recover it"
+            "no runtime is available to recover a dropped attempt; recovery waits for worker heartbeats to stop"
         );
         return;
     };

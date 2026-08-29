@@ -412,6 +412,7 @@ pub struct Consumer {
 pub struct Attempt {
     queue: Queue,
     row: JobRow,
+    runtime: Option<tokio::runtime::Handle>,
     settled: std::sync::atomic::AtomicBool,
 }
 
@@ -432,13 +433,19 @@ impl Consumer {
     /// Claims are taken with `FOR UPDATE SKIP LOCKED`, so concurrent consumers
     /// never wait on each other: a dequeue either claims rows or reports none.
     pub async fn dequeue(&self, limit: i64) -> Result<Vec<Attempt>, Error> {
+        let runtime = tokio::runtime::Handle::try_current().ok();
         Ok(self
             .queue
             .database
             .dequeue_consumer(limit, self.worker_id)
             .await?
             .into_iter()
-            .map(|row| Attempt { queue: self.queue.clone(), row, settled: std::sync::atomic::AtomicBool::new(false) })
+            .map(|row| Attempt {
+                queue: self.queue.clone(),
+                row,
+                runtime: runtime.clone(),
+                settled: std::sync::atomic::AtomicBool::new(false),
+            })
             .collect())
     }
 
@@ -522,7 +529,7 @@ impl Drop for Attempt {
         // guards every write here does, so a row that genuinely moved on to
         // another attempt or a terminal state is a no-op.
         if !self.settled.load(std::sync::atomic::Ordering::Acquire) {
-            self.queue.database.spawn_dropped_attempt_recovery(&self.row);
+            self.queue.database.spawn_dropped_attempt_recovery(&self.row, self.runtime.clone());
         }
     }
 }

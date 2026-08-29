@@ -2020,6 +2020,61 @@ async fn test_dropping_an_unsettled_consumer_attempt_recovers_the_job(pool: PgPo
     wait_for_recovery_stats(&db.queue, 1, 2).await;
 }
 
+/// An [`Attempt`] is `Send`, so custom consumers may hand CPU work to a plain thread. That thread has no entered Tokio
+/// runtime, but dropping the attempt there must still use the runtime that dequeued it: the live lease deliberately
+/// prevents the sweeper from reclaiming this untimed row instead.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_dropping_an_unsettled_consumer_attempt_off_runtime_recovers_the_job(pool: PgPool) {
+    let db = TestDb::new(pool.clone()).await;
+    let consumer = leased_consumer(&db.queue, Uuid::now_v7()).await;
+    let id = db
+        .queue
+        .enqueue_raw(new_job("dropped-off-runtime", |job| {
+            job.dedupe_key = Some("dropped-off-runtime".to_string());
+            job.config.max_attempts = 1;
+            job.config.timeout = None;
+        }))
+        .await
+        .unwrap()
+        .unwrap();
+    let attempt = consumer.dequeue(1).await.unwrap().into_iter().next().unwrap();
+    assert_eq!(attempt.job().id, id);
+    assert_eq!(attempt.job().timeout(), None);
+
+    std::thread::spawn(move || {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        drop(attempt);
+    })
+    .join()
+    .unwrap();
+
+    let row = wait_for_some(
+        Duration::from_secs(10),
+        Duration::from_millis(10),
+        "attempt dropped off the runtime was not aborted",
+        {
+            let queue = db.queue.clone();
+            move || {
+                let queue = queue.clone();
+                async move { queue.fetch_job(id).await.unwrap().filter(|row| row.status == JobStatus::Aborted) }
+            }
+        },
+    )
+    .await;
+    assert_eq!(row.error.as_deref(), Some("attempt dropped without settlement"));
+    wait_for_recovery_stats(&db.queue, 0, 1).await;
+
+    let replacement = db
+        .queue
+        .enqueue_raw(new_job("dropped-off-runtime", |job| {
+            job.dedupe_key = Some("dropped-off-runtime".to_string());
+        }))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(replacement, id, "recovery must release the terminal job's dedupe key");
+}
+
 /// And the recovery's guards make it a no-op once the row has moved on, so a
 /// settled attempt dropping in the ordinary way cannot disturb its successor.
 #[sqlx::test(migrations = "./migrations")]
