@@ -910,9 +910,12 @@ async fn test_stress_abort_and_retry_settle_every_row() {
 // Dashboard
 // ---------------------------------------------------------------------------
 
-/// The dashboard reads the same pool the worker runs on, and its routes are
-/// polled continuously by every open tab. Under a request flood beside a busy
-/// worker, no route may fail and the worker must still drain the queue.
+/// The dashboard reads the same pool the worker runs on, and its data routes
+/// are polled continuously by every open tab. Under a request flood beside a
+/// busy worker, no data route may fail and the worker must still drain the
+/// queue. `/health` has a deliberate two-second availability bound, so probe it
+/// outside the synthetic flood rather than treating its documented overload
+/// response as an internal failure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "stress test"]
 async fn test_stress_dashboard_serves_under_load_beside_a_worker() {
@@ -933,9 +936,11 @@ async fn test_stress_dashboard_serves_under_load_beside_a_worker() {
         .expect("build worker");
     let running = tokio::spawn(worker.run_until(shutdown.clone()));
 
+    let (status, body) = crate::dashboard_test::request(&router, "GET", "/health", None).await;
+    assert!(status.is_success(), "dashboard health before load answered {status}: {body:?}");
+
     let name = queue.name().to_string();
     let paths = [
-        "/health".to_string(),
         "/api/queues".to_string(),
         format!("/api/queues/{name}/jobs?limit=50"),
         format!("/api/queues/{name}/jobs?status=complete&limit=25"),
@@ -957,7 +962,7 @@ async fn test_stress_dashboard_serves_under_load_beside_a_worker() {
                     let (status, body) = crate::dashboard_test::request(&router, "GET", &path, None).await;
                     if status.is_server_error() {
                         failures.fetch_add(1, Ordering::SeqCst);
-                        eprintln!("dashboard {path} answered {status}: {body:?}");
+                        eprintln!("dashboard data route {path} answered {status}: {body:?}");
                     }
                     tokio::task::yield_now().await;
                 }
@@ -976,10 +981,14 @@ async fn test_stress_dashboard_serves_under_load_beside_a_worker() {
     for hammer in hammers {
         hammer.await.expect("hammer");
     }
+
+    let (status, body) = crate::dashboard_test::request(&router, "GET", "/health", None).await;
+    assert!(status.is_success(), "dashboard health after load answered {status}: {body:?}");
+
     shutdown.cancel();
     running.await.expect("worker join").expect("worker run");
 
-    assert_eq!(failures.load(Ordering::SeqCst), 0, "dashboard answered 5xx under load");
+    assert_eq!(failures.load(Ordering::SeqCst), 0, "dashboard data route answered 5xx under load");
     assert_fully_drained(&queue, JOBS as i64, "dashboard").await;
 }
 

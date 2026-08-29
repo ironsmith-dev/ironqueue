@@ -387,6 +387,12 @@ fn test_worker(queue: Queue) -> WorkerBuilder {
         .shutdown_grace(Duration::from_secs(5))
 }
 
+/// Keeps recovery out of tests that isolate the user-abort path. The default one-millisecond sweep grace can let a
+/// saturated runner mistake a delayed test heartbeat for a dead worker and settle the row before the abort reaches it.
+async fn build_abort_test_db(pool: PgPool) -> TestDb {
+    TestDb::with(pool, |builder| builder.sweep_grace(Duration::from_secs(60))).await
+}
+
 async fn wait_for_worker_lease(queue: &Queue, worker_id: Uuid) {
     wait_for_some(Duration::from_secs(5), Duration::from_millis(10), "worker did not register its lease", || async {
         list_workers(queue).await.iter().any(|worker| worker.id == worker_id).then_some(())
@@ -730,7 +736,7 @@ async fn test_shutdown_records_a_handler_failure_that_is_not_classified_as_abort
 
 #[sqlx::test(migrations = "./migrations")]
 async fn test_shutdown_requeue_is_unconfirmed_when_the_row_is_aborting(pool: PgPool) {
-    let db = TestDb::new(pool.clone()).await;
+    let db = build_abort_test_db(pool.clone()).await;
     let handle = db.queue.enqueue(errs_on_shutdown_cancellation::job(())).await.unwrap().unwrap();
     let probe = CancellationObservedProbe {
         started: Arc::new(tokio::sync::Notify::new()),
@@ -1030,7 +1036,7 @@ async fn test_panicking_job_fails_without_killing_the_worker(pool: PgPool) {
 
 #[sqlx::test(migrations = "./migrations")]
 async fn test_abort_cancels_a_running_job(pool: PgPool) {
-    let db = TestDb::new(pool.clone()).await;
+    let db = build_abort_test_db(pool.clone()).await;
     let handle = db.queue.enqueue(slow_but_abortable::job(())).await.unwrap().unwrap();
     let worker = test_worker(db.queue.clone()).register_job(slow_but_abortable).build().unwrap();
     let token = CancellationToken::new();
@@ -1050,7 +1056,7 @@ async fn test_abort_cancels_a_running_job(pool: PgPool) {
 
 #[sqlx::test(migrations = "./migrations")]
 async fn test_user_abort_allows_handler_cleanup_and_finishes_aborted(pool: PgPool) {
-    let db = TestDb::new(pool.clone()).await;
+    let db = build_abort_test_db(pool.clone()).await;
     let handle = db.queue.enqueue(cleans_up_after_user_abort::job(())).await.unwrap().unwrap();
     let probe = AbortCleanupProbe {
         started: Arc::new(tokio::sync::Notify::new()),
@@ -1086,7 +1092,7 @@ async fn test_user_abort_allows_handler_cleanup_and_finishes_aborted(pool: PgPoo
 
 #[sqlx::test(migrations = "./migrations")]
 async fn test_user_abort_forces_handler_stop_when_cleanup_exceeds_abort_grace(pool: PgPool) {
-    let db = TestDb::new(pool.clone()).await;
+    let db = build_abort_test_db(pool.clone()).await;
     let handle = db.queue.enqueue(exceeds_abort_grace::job(())).await.unwrap().unwrap();
     let probe = ForcedAbortProbe {
         started: Arc::new(tokio::sync::Notify::new()),
@@ -1121,7 +1127,7 @@ async fn test_user_abort_forces_handler_stop_when_cleanup_exceeds_abort_grace(po
 
 #[sqlx::test(migrations = "./migrations")]
 async fn test_user_abort_stops_handler_immediately_when_abort_grace_is_zero(pool: PgPool) {
-    let db = TestDb::new(pool.clone()).await;
+    let db = build_abort_test_db(pool.clone()).await;
     let handle = db.queue.enqueue(exceeds_abort_grace::job(())).await.unwrap().unwrap();
     let probe = ForcedAbortProbe {
         started: Arc::new(tokio::sync::Notify::new()),

@@ -28,17 +28,7 @@ jobs:
         with:
           tool: cargo-audit@0.22.2,cargo-llvm-cov@0.8.7,prek@0.4.13,sqlx-cli@0.9.0
 
-      - name: Audit dependencies
-        run: cargo audit --deny yanked
-
-      - name: Run pre-commit hooks
+      # This is the same command the prek commit hook and scripts/push run locally. Keep every check in prek.toml so
+      # local and CI validation cannot drift apart.
+      - name: Run repository checks
         run: prek run --all-files
-
-      - name: Check minimum supported Rust version
-        run: cargo +1.95.0 check --locked --workspace --all-targets --all-features
-
-      - name: Check queue-only feature set
-        run: cargo check --locked -p ironqueue --lib --bins --no-default-features
-
-      - name: Run stress tests
-        run: scripts/stress

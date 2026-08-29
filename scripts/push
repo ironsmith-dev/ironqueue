@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+cd "${BASH_SOURCE[0]%/*}/.."
+
+# Git opens the remote transport before invoking its pre-push hook. Run the full suite first so a slow validation does
+# not leave an SSH connection idle long enough for the server to close it. The fast pre-push hook checks this exact HEAD.
+prek run --all-files
+verified_head="$(git rev-parse --verify HEAD)"
+IRONQUEUE_PREK_PUSH_HEAD="$verified_head" git push "$@"

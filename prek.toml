@@ -1,6 +1,8 @@
-# Configuration for `prek` (https://prek.j178.dev), run on every commit.
+# Configuration for `prek` (https://prek.j178.dev), run before every commit and by `scripts/push` before every push.
 # Schema: https://www.schemastore.org/prek.json
 minimum_prek_version = "0.3.11"
+default_install_hook_types = ["pre-commit", "pre-push"]
+default_stages = ["pre-commit", "manual"]
 
 # Hooks run cheapest first and the run stops at the first failure, so a commit
 # that is already going to be rejected never pays for a full test run.
@@ -29,12 +31,28 @@ hooks = [
 repo = "local"
 
 [[repos.hooks]]
+id = "verified-push"
+name = "verified prek push"
+entry = "scripts/check-push"
+language = "system"
+stages = ["pre-push"]
+always_run = true
+pass_filenames = false
+
+[[repos.hooks]]
+id = "audit"
+name = "cargo audit"
+entry = "cargo audit --deny yanked"
+language = "system"
+always_run = true
+pass_filenames = false
+
+[[repos.hooks]]
 id = "cargo-fmt"
 name = "cargo fmt"
 entry = "cargo fmt --all -- --check"
 language = "system"
-# `rust-toolchain.toml` alongside the Rust files, because it chooses the rustfmt that formats them.
-files = '(\.rs$|^rust-toolchain\.toml$)'
+always_run = true
 pass_filenames = false
 
 [[repos.hooks]]
@@ -42,7 +60,7 @@ id = "lint"
 name = "cargo clippy"
 entry = "scripts/lint"
 language = "system"
-files = '^(Cargo\.(toml|lock)|rust-toolchain\.toml|ironqueue(?:-macros)?/(Cargo\.toml|sqlx\.toml|migrations/.*|.*\.rs)|scripts/lint)$'
+always_run = true
 pass_filenames = false
 
 [[repos.hooks]]
@@ -50,9 +68,7 @@ id = "migrate"
 name = "SQLx migrations"
 entry = "scripts/migrate"
 language = "system"
-files = '^(Cargo\.(toml|lock)|prek\.toml|compose\.yaml|ironqueue(?:-macros)?/|scripts/migrate)'
-# Dashboard files cannot change a query.
-exclude = '^ironqueue/dashboard/'
+always_run = true
 pass_filenames = false
 
 [[repos.hooks]]
@@ -60,7 +76,7 @@ id = "dashboard-js-test"
 name = "dashboard JavaScript tests"
 entry = "node --test ironqueue/tests/dashboard/app.test.mjs"
 language = "system"
-files = '^(ironqueue/dashboard/app\.mjs|ironqueue/tests/dashboard/app\.test\.mjs)$'
+always_run = true
 pass_filenames = false
 
 [[repos.hooks]]
@@ -68,5 +84,29 @@ id = "test"
 name = "cargo test"
 entry = "scripts/test"
 language = "system"
-files = '^(Cargo\.(toml|lock)|prek\.toml|compose\.yaml|rust-toolchain\.toml|ironqueue(?:-macros)?/|scripts/(migrate|publish|test))'
+always_run = true
+pass_filenames = false
+
+[[repos.hooks]]
+id = "msrv"
+name = "minimum supported Rust version"
+entry = "cargo +1.95.0 check --locked --workspace --all-targets --all-features"
+language = "system"
+always_run = true
+pass_filenames = false
+
+[[repos.hooks]]
+id = "queue-only"
+name = "queue-only feature set"
+entry = "cargo check --locked -p ironqueue --lib --bins --no-default-features"
+language = "system"
+always_run = true
+pass_filenames = false
+
+[[repos.hooks]]
+id = "stress"
+name = "stress tests"
+entry = "scripts/stress"
+language = "system"
+always_run = true
 pass_filenames = false
