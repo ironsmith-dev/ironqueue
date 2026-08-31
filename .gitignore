@@ -1,51 +1,49 @@
-# cargo
+# Rust
 debug
 target
-.worktrees/
-
-# SQLx query metadata is not used; tests validate queries against Postgres.
-.sqlx/
-
-# rustfmt
 **/*.rs.bk
 
-# coverage (cargo-llvm-cov)
+# SQLx
+.sqlx/
+
+# Coverage (cargo-llvm-cov)
 *.profdata
 *.profraw
 lcov.info
 
-# mutation testing (cargo-mutants)
+# Mutation testing (cargo-mutants)
 **/mutants.out*/
 
-# local browser QA
+# Playwright
 .playwright/
 .playwright-mcp/
 playwright-report/
 test-results/
 
-# agents
+# Agent tools
+.worktrees/
 **/.claude/settings.local.json
 .claude/scheduled_tasks.lock
 .claude/worktrees/
 
-# agent planning
+# Agent planning
+plans/
 plan.html
 TODO.md
-todo.md
 
-# environment: `DATABASE_URL` lives here, and sqlx-cli loads `.env` on its own
+# Environment
 .direnv/
 .env
 .env.*
 .envrc
 
-# backups
+# Backups
 *.bak
 *.orig
 *.rej
 *~
 
-# logs
+# Logs
 *.log
 
 # IDEs

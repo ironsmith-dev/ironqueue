@@ -18,7 +18,25 @@ See [README.md](README.md).
   `synchronous_commit = on` for its own database first, or it asserts against PostgreSQL's configuration rather than
   against this crate.
 - Use runtime `sqlx` query functions, not the compile-time macro variants.
-- Name every sqlx migration `NNNN_migration.sql`, where `NNNN` is the zero-padded version, consecutive from `0001`.
+- Name every sqlx migration `NNNN_migration.sql`, where `NNNN` starts at `0001` and increments by one with zero padding.
+
+### Planning
+
+- When planning UI changes, run `scripts/plan`, then populate the new preview with the UI under review. The command
+  creates `plans/plan-TIMESTAMP.html` using the current Unix timestamp and creates or updates the `plan.html` symlink.
+- In `plan.html`, show only the UI under review. Omit commentary unless requested.
+
+### Code Reviews
+
+- Use subagents for code reviews. When a review prompt names `Claude` or `Codex`, use the following model and effort:
+    - `Claude`: Claude Code CLI with Fable 5 at max effort.
+    - `Codex` (subagent): Codex CLI with GPT-5.6 Sol at max effort.
+- Give each new subagent just enough context so review-fix loops do not drag on by rediscovering the same issues,
+  over-engineering, or going too far down rabbit holes.
+- Subagents must review the entire change thoroughly and not stop after finding the first few issues.
+- Reviews may extend beyond the uncommitted changes when useful. Report and address other issues noticed along the way.
+- Assign each issue a severity of high, medium, or low.
+- Have every issue confirmed by at least one other agent, either the parent agent or another subagent.
 
 ### Style
 
@@ -30,7 +48,8 @@ See [README.md](README.md).
 ### Documentation
 
 - Do NOT edit AGENTS.md, CLAUDE.md or README.md unless explicitly told to do so.
-- Use plain English ELI5 style
+- Use plain English, ELI5 style without replacing canonical, context-appropriate terms with less precise words.
+- Use terms consistently. Avoid synonyms for variety.
 
 ### Git
 
@@ -43,5 +62,5 @@ See [README.md](README.md).
 ### Occam's Razor
 
 - Prefer deleting, consolidating, or reusing existing code before adding code.
-- Choose the simplest design that fully satisfies the current requirements; add abstractions, extensions, or
-  dependencies only when concrete requirements or repeated patterns justify them.
+- Choose the simplest design that fully satisfies the current requirements; add abstractions, extensions, dependencies
+  etc. only when concrete requirements or repeated patterns justify them.

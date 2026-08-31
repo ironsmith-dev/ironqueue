@@ -33,7 +33,7 @@ repo = "local"
 [[repos.hooks]]
 id = "verified-push"
 name = "verified prek push"
-entry = "scripts/check-push"
+entry = "scripts/push --check"
 language = "system"
 stages = ["pre-push"]
 always_run = true

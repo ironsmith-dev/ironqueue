@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+cd "${BASH_SOURCE[0]%/*}/.."
+
+mkdir -p plans
+
+while true; do
+    timestamp="$(date +%s)"
+    preview="plans/plan-$timestamp.html"
+    if (set -o noclobber; : > "$preview") 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
+
+ln -sfn "$preview" plan.html
+printf '%s\n' "$preview"
