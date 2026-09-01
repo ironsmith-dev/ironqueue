@@ -28,9 +28,9 @@ See [README.md](README.md).
 
 ### Code Reviews
 
-- Use subagents for code reviews. When a review prompt names `Claude` or `Codex`, use the following model and effort:
-    - `Claude`: Claude Code CLI with Fable 5 at max effort.
-    - `Codex` (subagent): Codex CLI with GPT-5.6 Sol at max effort.
+- Use subagents for code reviews. When a prompt names `claude` or `codex` for reviews, use the following:
+    - `claude`: Claude Code CLI with the strongest model at max effort.
+    - `codex` (subagent): Codex CLI with the strongest model at max effort.
 - Give each new subagent just enough context so review-fix loops do not drag on by rediscovering the same issues,
   over-engineering, or going too far down rabbit holes.
 - Subagents must review the entire change thoroughly and not stop after finding the first few issues.

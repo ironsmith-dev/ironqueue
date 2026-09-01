@@ -1,61 +1,70 @@
-# Rust
-debug
-target
-**/*.rs.bk
-
-# SQLx
-.sqlx/
-
-# Coverage (cargo-llvm-cov)
-*.profdata
-*.profraw
-lcov.info
-
-# Mutation testing (cargo-mutants)
-**/mutants.out*/
-
-# Playwright
-.playwright/
-.playwright-mcp/
-playwright-report/
-test-results/
-
-# Agent tools
-.worktrees/
-**/.claude/settings.local.json
-.claude/scheduled_tasks.lock
-.claude/worktrees/
-
-# Agent planning
-plans/
-plan.html
-TODO.md
+# OS
+.DS_Store
+._*
+Desktop.ini
+Thumbs.db
+desktop.ini
 
 # Environment
 .direnv/
 .env
 .env.*
+!.env.example
 .envrc
+.envrc.*
+
+# SQLx
+.sqlx/
+
+# Agents
+**/.claude/scheduled_tasks.lock
+**/.claude/settings.local.json
+**/.claude/worktrees/
+/.worktrees/
+/TODO.md
+/plan.html
+/plans/
+
+# Editors
+*.iml
+*.sw[mnop]
+.cursor/
+.idea/
+.vs/
+.vscode/
+.zed/
+
+# Build
+target/
+
+# Secrets
+.netrc
+id_ecdsa
+id_ed25519
+id_rsa
 
 # Backups
 *.bak
+*.bk
 *.orig
 *.rej
 *~
 
 # Logs
 *.log
+*.log.[0-9]*
+*.log.gz
 
-# IDEs
-*.iml
-*.sw[nop]
-.cursor/
-.idea/*
-.vs/
-.vscode/
-.zed/
+# Testing
+*.profdata
+*.profraw
+coverage/
+lcov.info
+mutants.out*/
+perf.data*
 
-# OS
-._*
-.DS_Store
-Thumbs.db
+# Playwright
+.playwright/
+.playwright-mcp/
+playwright-report/
+test-results/
