@@ -1,7 +1,7 @@
-# Configuration for `prek` (https://prek.j178.dev), run before every commit and by `scripts/push` before every push.
+# Configuration for `prek` (https://prek.j178.dev), run before every commit and in CI.
 # Schema: https://www.schemastore.org/prek.json
 minimum_prek_version = "0.3.11"
-default_install_hook_types = ["pre-commit", "pre-push"]
+default_install_hook_types = ["pre-commit"]
 default_stages = ["pre-commit", "manual"]
 
 # Hooks run cheapest first and the run stops at the first failure, so a commit
@@ -29,15 +29,6 @@ hooks = [
 
 [[repos]]
 repo = "local"
-
-[[repos.hooks]]
-id = "verified-push"
-name = "verified prek push"
-entry = "scripts/push --check"
-language = "system"
-stages = ["pre-push"]
-always_run = true
-pass_filenames = false
 
 [[repos.hooks]]
 id = "audit"
