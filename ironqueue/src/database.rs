@@ -9,7 +9,7 @@ use sqlx::error::BoxDynError;
 use sqlx::migrate::Migrate;
 use sqlx::pool::PoolConnection;
 use sqlx::postgres::{PgConnection, PgPool, PgPoolOptions, PgTypeInfo, PgValueRef};
-use sqlx::{Decode, Postgres, Type};
+use sqlx::{Connection, Decode, Postgres, Transaction, Type};
 use uuid::Uuid;
 
 use crate::Error;
@@ -125,30 +125,154 @@ async fn find_migration_status(connection: &mut PgConnection) -> Result<Migratio
     if applied.len() == expected.len() { Ok(MigrationStatus::Current) } else { Ok(MigrationStatus::Pending) }
 }
 
-struct MigrationConnectionGuard<'a> {
-    connection: &'a mut PoolConnection<Postgres>,
+struct PoolConnectionGuard {
+    connection: PoolConnection<Postgres>,
     close_on_drop: bool,
 }
 
-impl<'a> MigrationConnectionGuard<'a> {
-    fn new(connection: &'a mut PoolConnection<Postgres>) -> Self {
+impl PoolConnectionGuard {
+    fn new(connection: PoolConnection<Postgres>) -> Self {
         Self { connection, close_on_drop: true }
     }
 
     fn connection(&mut self) -> &mut PgConnection {
-        &mut *self.connection
+        &mut self.connection
     }
 
     fn disarm(&mut self) {
         self.close_on_drop = false;
     }
+
+    async fn begin_transaction(&mut self) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
+        // SQLx 0.9 can miss the rollback when BEGIN is cancelled before it records the transaction depth. Keep the
+        // connection out of the pool until BEGIN succeeds and SQLx's transaction guard can perform that rollback.
+        self.close_on_drop = true;
+        let transaction = self.connection.begin().await?;
+        self.close_on_drop = false;
+        Ok(transaction)
+    }
 }
 
-impl Drop for MigrationConnectionGuard<'_> {
+impl Drop for PoolConnectionGuard {
     fn drop(&mut self) {
         if self.close_on_drop {
             self.connection.close_on_drop();
         }
+    }
+}
+
+#[cfg(test)]
+mod connection_guard_tests {
+    use std::future::{Future, poll_fn};
+    use std::pin::pin;
+    use std::task::Poll;
+
+    use super::*;
+    use crate::Queue;
+
+    async fn connect_single_connection_queue(pool: &PgPool) -> Queue {
+        let shared = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        Queue::builder("postgres://unused").pool(shared).connect().await.unwrap()
+    }
+
+    async fn poll_once_and_cancel(future: impl Future) {
+        let mut future = pin!(future);
+        poll_fn(|context| {
+            assert!(future.as_mut().poll(context).is_pending(), "the held advisory lock must prevent completion");
+            Poll::Ready(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn test_cancelled_begin_preserves_autocommit_on_the_shared_pool(pool: PgPool) {
+        let queue = connect_single_connection_queue(&pool).await;
+        let mut connection = PoolConnectionGuard::new(queue.pool().acquire().await.unwrap());
+        let original_pid =
+            sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()").fetch_one(connection.connection()).await.unwrap();
+        let mut gate = pool.begin().await.unwrap();
+        sqlx::raw_sql("SELECT pg_advisory_xact_lock(17293401)").execute(&mut *gate).await.unwrap();
+
+        // Park a statement ahead of BEGIN on this connection. SQLx sends BEGIN but cannot finish reading its response
+        // until the gate opens, so cancellation always hits transaction startup regardless of machine speed.
+        poll_once_and_cancel(sqlx::raw_sql("SELECT pg_advisory_xact_lock(17293401)").execute(connection.connection()))
+            .await;
+        poll_once_and_cancel(connection.begin_transaction()).await;
+        drop(connection);
+        gate.rollback().await.unwrap();
+
+        let worker_id = Uuid::now_v7();
+        queue.consumer(worker_id).heartbeat(serde_json::json!({}), None, Duration::from_secs(30)).await.unwrap();
+        let visible = sqlx::query_scalar::<_, i64>(
+            "-- noinspection SqlResolve
+             SELECT count(*) FROM ironqueue.workers WHERE id = $1",
+        )
+        .bind(worker_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(visible, 1, "a successful heartbeat must commit and be visible from another connection");
+        let replacement_pid =
+            sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()").fetch_one(queue.pool()).await.unwrap();
+        assert_ne!(replacement_pid, original_pid, "cancelled BEGIN must discard its connection");
+        queue.pool().close().await;
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn test_completed_begin_preserves_transaction_outcomes_and_connection_reuse(pool: PgPool) {
+        let queue = connect_single_connection_queue(&pool).await;
+        let original_pid =
+            sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()").fetch_one(queue.pool()).await.unwrap();
+
+        for outcome in ["commit", "rollback", "drop"] {
+            let worker_id = Uuid::now_v7();
+            let mut connection = PoolConnectionGuard::new(queue.pool().acquire().await.unwrap());
+            let mut transaction = connection.begin_transaction().await.unwrap();
+            sqlx::query(
+                "-- noinspection SqlResolve
+                 INSERT INTO ironqueue.workers (id, queue, expires_at) VALUES ($1, 'default', now())",
+            )
+            .bind(worker_id)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+            match outcome {
+                "commit" => transaction.commit().await.unwrap(),
+                "rollback" => transaction.rollback().await.unwrap(),
+                _ => drop(transaction),
+            }
+            drop(connection);
+
+            let reused_pid =
+                sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()").fetch_one(queue.pool()).await.unwrap();
+            assert_eq!(reused_pid, original_pid, "a completed BEGIN must allow connection reuse after {outcome}");
+            let visible = sqlx::query_scalar::<_, i64>(
+                "-- noinspection SqlResolve
+                 SELECT count(*) FROM ironqueue.workers WHERE id = $1",
+            )
+            .bind(worker_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(visible, i64::from(outcome == "commit"), "incorrect transaction outcome after {outcome}");
+
+            queue.consumer(worker_id).heartbeat(serde_json::json!({}), None, Duration::from_secs(30)).await.unwrap();
+            let lease = sqlx::query_scalar::<_, bool>(
+                "-- noinspection SqlResolve
+                 SELECT expires_at > now() FROM ironqueue.workers WHERE id = $1",
+            )
+            .bind(worker_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(lease, "the pooled connection must return to autocommit after {outcome}");
+        }
+        queue.pool().close().await;
     }
 }
 
@@ -161,8 +285,7 @@ async fn set_lock_timeout(connection: &mut PgConnection, value: &str) -> Result<
 }
 
 async fn ensure_migrations(pool: &PgPool, lock_timeout: Duration) -> Result<(), Error> {
-    let mut pooled = pool.acquire().await?;
-    let mut connection = MigrationConnectionGuard::new(&mut pooled);
+    let mut connection = PoolConnectionGuard::new(pool.acquire().await?);
     let previous_lock_timeout = sqlx::query_scalar::<_, String>("SELECT current_setting('lock_timeout')")
         .fetch_one(connection.connection())
         .await?;
@@ -1015,7 +1138,8 @@ impl Database {
             // re-entering through the public entry point paid for all six twice
             // on the hot path of every keyed publish — which is every cron
             // occurrence and every idempotent enqueue.
-            let mut transaction = self.pool.begin().await?;
+            let mut connection = PoolConnectionGuard::new(self.pool.acquire().await?);
+            let mut transaction = connection.begin_transaction().await?;
             let result = self.enqueue_validated_in(&mut transaction, job, delay).await?;
             transaction.commit().await?;
             return Ok(result);
@@ -1168,7 +1292,8 @@ impl Database {
         let next_run_at = entry.next_occurrence(now)?;
         let policy = entry.options.misfire.kind();
         let grace_ms = entry.options.misfire.grace_ms();
-        let mut tx = self.pool.begin().await?;
+        let mut connection = PoolConnectionGuard::new(self.pool.acquire().await?);
+        let mut tx = connection.begin_transaction().await?;
         sqlx::query(
             r#"
             INSERT INTO ironqueue.cron_schedules (
@@ -1293,7 +1418,8 @@ impl Database {
             .map_err(|_| Error::Config("cron revision must fit PostgreSQL bigint".into()))?;
         let policy = entry.options.misfire.kind();
         let grace_ms = entry.options.misfire.grace_ms();
-        let mut tx = self.pool.begin().await?;
+        let mut connection = PoolConnectionGuard::new(self.pool.acquire().await?);
+        let mut tx = connection.begin_transaction().await?;
         let observed = sqlx::query_as::<_, ObservedCron>(
             r#"
             SELECT name, expression, revision, misfire_policy, grace_ms,
@@ -2024,7 +2150,8 @@ impl Database {
         // dedupe: carrying it onto a manual retry would collide with the
         // next scheduled occurrence and silently refuse the retry, so cron
         // retries run as keyless one-offs.
-        let mut tx = self.pool.begin().await?;
+        let mut connection = PoolConnectionGuard::new(self.pool.acquire().await?);
+        let mut tx = connection.begin_transaction().await?;
         let new_id = sqlx::query_scalar::<_, Uuid>(
             r#"
             WITH source AS MATERIALIZED (
@@ -2113,7 +2240,8 @@ impl Database {
             return Err(Error::Config("dequeue limit must be greater than zero".into()));
         }
 
-        let mut transaction = self.pool.begin().await?;
+        let mut connection = PoolConnectionGuard::new(self.pool.acquire().await?);
+        let mut transaction = connection.begin_transaction().await?;
         let claim = sqlx::query_as::<_, JobRow>(DEQUEUE_CLAIM_SQL)
             .bind(&self.name)
             .bind(self.priorities.0)
@@ -2158,6 +2286,7 @@ impl Database {
             claims: jobs.iter().map(|job| DatabaseUnacknowledgedClaim { id: job.id, attempts: job.attempts }).collect(),
         };
         transaction.commit().await?;
+        drop(connection);
 
         // The underfilled-batch probe is its own statement, run after the
         // decoded claim commits. It needs no consistency with the batch, and
@@ -2786,7 +2915,8 @@ async fn requeue_unacknowledged_claims(
     }
     let mut requeued = 0;
     let mut aborted = 0;
-    let mut transaction = context.pool.begin().await?;
+    let mut connection = PoolConnectionGuard::new(context.pool.acquire().await?);
+    let mut transaction = connection.begin_transaction().await?;
     // Strictly after the claim transaction being resolved: the dequeue takes
     // this pair transaction-scoped inside its claiming statement, so acquiring
     // it here blocks until an in-flight COMMIT has resolved either way. A pass
@@ -3008,7 +3138,8 @@ async fn resolve_dropped_attempt(
     retry_delay_ms: i64,
     claim: &DatabaseUnacknowledgedClaim,
 ) -> Result<DroppedAttemptResolution, sqlx::Error> {
-    let mut transaction = context.pool.begin().await?;
+    let mut connection = PoolConnectionGuard::new(context.pool.acquire().await?);
+    let mut transaction = connection.begin_transaction().await?;
     let row = sqlx::query_as::<_, RequeueResult>(REQUEUE_GUARDED_SQL)
         .bind(claim.id)
         .bind(retry_delay_ms)
