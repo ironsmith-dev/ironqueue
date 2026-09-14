@@ -19,6 +19,9 @@ pub(crate) struct JobAttrs {
     pub timeout_ms: Option<Option<u64>>,
     /// `result_ttl_ms = 3_600_000` — result retention; zero deletes immediately.
     pub result_ttl_ms: Option<ResultTtl>,
+    /// `failed_ttl_ms = 604_800_000` — retention after a failed or aborted
+    /// finish; zero deletes immediately.
+    pub failed_ttl_ms: Option<ResultTtl>,
     /// `retry_delay_ms = 500` — base retry delay.
     pub retry_delay_ms: Option<u64>,
     /// `max_backoff_ms = 60_000` — capped exponential backoff.
@@ -32,11 +35,19 @@ pub(crate) struct JobAttrs {
     pub durations: Vec<(&'static str, u64, Span)>,
 }
 
-/// Result retention as written in the attribute.
+/// A retention as written in the attribute: `result_ttl_ms` or
+/// `failed_ttl_ms`.
 #[derive(Debug)]
 pub(crate) enum ResultTtl {
     ForMs(u64),
     Delete,
+}
+
+impl ResultTtl {
+    /// Zero is the delete-immediately sentinel rather than a duration.
+    fn from_ms(ms: u64) -> Self {
+        if ms == 0 { ResultTtl::Delete } else { ResultTtl::ForMs(ms) }
+    }
 }
 
 /// Which attribute macro is parsing. `revision` is cron-only, so both the
@@ -71,11 +82,11 @@ impl AttrMode {
     fn expected_keys(self) -> &'static str {
         match self {
             AttrMode::Job => {
-                "name, max_attempts, timeout_ms, result_ttl_ms, retry_delay_ms, \
+                "name, max_attempts, timeout_ms, result_ttl_ms, failed_ttl_ms, retry_delay_ms, \
                  max_backoff_ms, priority"
             }
             AttrMode::Cron => {
-                "name, max_attempts, timeout_ms, result_ttl_ms, retry_delay_ms, \
+                "name, max_attempts, timeout_ms, result_ttl_ms, failed_ttl_ms, retry_delay_ms, \
                  max_backoff_ms, priority, revision"
             }
         }
@@ -149,11 +160,12 @@ impl JobAttrs {
                         "result_ttl_ms" => {
                             let result_ttl_ms = milliseconds_value("result_ttl_ms", &nv.value)?;
                             attrs.record_duration("result_ttl_ms", result_ttl_ms, nv.value.span());
-                            attrs.result_ttl_ms = Some(if result_ttl_ms == 0 {
-                                ResultTtl::Delete
-                            } else {
-                                ResultTtl::ForMs(result_ttl_ms)
-                            });
+                            attrs.result_ttl_ms = Some(ResultTtl::from_ms(result_ttl_ms));
+                        }
+                        "failed_ttl_ms" => {
+                            let failed_ttl_ms = milliseconds_value("failed_ttl_ms", &nv.value)?;
+                            attrs.record_duration("failed_ttl_ms", failed_ttl_ms, nv.value.span());
+                            attrs.failed_ttl_ms = Some(ResultTtl::from_ms(failed_ttl_ms));
                         }
                         "retry_delay_ms" => {
                             let retry_delay_ms = milliseconds_value("retry_delay_ms", &nv.value)?;
@@ -358,6 +370,7 @@ mod tests {
         assert!(attrs.max_attempts.is_none());
         assert!(attrs.timeout_ms.is_none());
         assert!(attrs.result_ttl_ms.is_none());
+        assert!(attrs.failed_ttl_ms.is_none());
         assert!(attrs.retry_delay_ms.is_none());
         assert!(attrs.max_backoff_ms.is_none());
         assert!(attrs.priority.is_none());
@@ -371,6 +384,7 @@ mod tests {
             max_attempts = 3,
             timeout_ms = 30_000,
             result_ttl_ms = 3_600_000,
+            failed_ttl_ms = 86_400_000,
             retry_delay_ms = 500,
             max_backoff_ms = 120_000,
             priority = -1,
@@ -381,6 +395,7 @@ mod tests {
         assert_eq!(attrs.max_attempts, Some(3));
         assert_eq!(attrs.timeout_ms, Some(Some(30_000)));
         assert!(matches!(attrs.result_ttl_ms, Some(ResultTtl::ForMs(3_600_000))));
+        assert!(matches!(attrs.failed_ttl_ms, Some(ResultTtl::ForMs(86_400_000))));
         assert_eq!(attrs.retry_delay_ms, Some(500));
         assert_eq!(attrs.max_backoff_ms, Some(120_000));
         assert_eq!(attrs.priority, Some(-1));
@@ -484,6 +499,7 @@ mod tests {
         for key in [
             "timeout_ms",
             "result_ttl_ms",
+            "failed_ttl_ms",
             "retry_delay_ms",
             "max_backoff_ms",
         ] {
@@ -522,6 +538,7 @@ mod tests {
     fn test_zero_values_parse_to_expected_values() {
         assert_eq!(parse(quote!(timeout_ms = 0)).unwrap().timeout_ms, Some(None));
         assert!(matches!(parse(quote!(result_ttl_ms = 0)).unwrap().result_ttl_ms, Some(ResultTtl::Delete)));
+        assert!(matches!(parse(quote!(failed_ttl_ms = 0)).unwrap().failed_ttl_ms, Some(ResultTtl::Delete)));
         assert_eq!(parse(quote!(priority = 7)).unwrap().priority, Some(7));
         assert_eq!(parse(quote!(priority = -32768)).unwrap().priority, Some(i16::MIN));
         // The same value written anywhere but last arrives as a negation
@@ -579,6 +596,7 @@ mod tests {
             "max_attempts",
             "timeout_ms",
             "result_ttl_ms",
+            "failed_ttl_ms",
             "retry_delay_ms",
             "max_backoff_ms",
         ] {
@@ -612,13 +630,16 @@ mod tests {
     /// `tests/macros/fail.stderr` pins the resulting diagnostic.
     #[test]
     fn test_every_millisecond_literal_is_recorded_with_its_span() {
-        let attrs = parse(quote!(timeout_ms = 1, result_ttl_ms = 2, retry_delay_ms = 3, max_backoff_ms = 4)).unwrap();
+        let attrs =
+            parse(quote!(timeout_ms = 1, result_ttl_ms = 2, failed_ttl_ms = 5, retry_delay_ms = 3, max_backoff_ms = 4))
+                .unwrap();
         let recorded: Vec<_> = attrs.durations.iter().map(|(key, ms, _)| (*key, *ms)).collect();
         assert_eq!(
             recorded,
             vec![
                 ("timeout_ms", 1),
                 ("result_ttl_ms", 2),
+                ("failed_ttl_ms", 5),
                 ("retry_delay_ms", 3),
                 ("max_backoff_ms", 4),
             ]
@@ -629,7 +650,7 @@ mod tests {
     /// than a duration, so it needs no bound check.
     #[test]
     fn test_sentinel_zero_durations_are_not_recorded_for_the_bound_check() {
-        let attrs = parse(quote!(timeout_ms = 0, result_ttl_ms = 0, retry_delay_ms = 0)).unwrap();
+        let attrs = parse(quote!(timeout_ms = 0, result_ttl_ms = 0, failed_ttl_ms = 0, retry_delay_ms = 0)).unwrap();
         assert!(attrs.durations.is_empty(), "{:?}", attrs.durations);
     }
 }

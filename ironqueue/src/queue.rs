@@ -48,6 +48,12 @@ pub struct QueueCounts {
     /// [`Queue::abort_job`], and by the [`Sweeper`] recovering an attempt that had no attempts
     /// left to retry with.
     pub aborted: i64,
+    /// When the oldest job that is ready to run now became due, or `None`
+    /// when nothing is ready. Its age is the queue's backlog latency: the
+    /// counts above cannot tell a busy queue from a stalled one, and this
+    /// can — alert on it growing, not on `queued` alone.
+    #[sqlx(try_from = "crate::database::OptionalTimestamp")]
+    pub oldest_ready_at: Option<jiff::Timestamp>,
 }
 
 /// Counters accumulated by this queue handle since start.
@@ -562,6 +568,7 @@ pub struct QueueBuilder {
     sweep_grace: Duration,
     sweep_batch_size: u32,
     migration_lock_timeout: Duration,
+    notify_throttle: Option<Duration>,
 }
 
 impl QueueBuilder {
@@ -648,6 +655,33 @@ impl QueueBuilder {
         self
     }
 
+    /// Rate-limits the wakeup notifications this handle's enqueues emit to
+    /// one per `window`. Default: none, every due enqueue notifies.
+    ///
+    /// Every `NOTIFY` is a cluster-wide serialization point: PostgreSQL
+    /// commits notifying transactions one at a time, holding one lock through
+    /// each commit's WAL flush, so a fleet of producers enqueueing at speed
+    /// degrades to one durable commit at a time however many connections it
+    /// has. A throttle caps how many of those commits this process asks for.
+    ///
+    /// What it costs is wakeup latency, not delivery: a job enqueued inside a
+    /// window after a worker went idle is claimed at that worker's next
+    /// [`WorkerBuilder::poll_interval`](crate::WorkerBuilder::poll_interval)
+    /// rather than at once. Workers that are busy are unaffected, because a
+    /// fetcher with work re-polls on its own. So this suits bulk producers,
+    /// and [`Queue::enqueue_batch`] — one notification per batch — usually
+    /// suits them better still. The throttle is per handle: it counts this
+    /// process's enqueues, not the queue's, and it spends its slot when an
+    /// enqueue is attempted, so a deduplicated or failed one still consumes
+    /// the window. A throttled handle also decides on its own clock whether a
+    /// scheduled row is due, so a row due within a clock skew of now may wake
+    /// nobody; without a throttle that decision is the server's. Zero
+    /// disables it.
+    pub fn notify_throttle(mut self, window: Duration) -> Self {
+        self.notify_throttle = Some(window);
+        self
+    }
+
     /// Maximum time schema initialization waits for a PostgreSQL lock. Default
     /// 30 seconds. Connecting with a current migration history does not take
     /// the migrator's advisory lock. The previous session setting is restored
@@ -697,6 +731,7 @@ impl QueueBuilder {
                     max_connections: self.max_connections,
                     min_connections: self.min_connections,
                     migration_lock_timeout: self.migration_lock_timeout,
+                    notify_throttle: self.notify_throttle,
                 })
                 .await?,
             ),
@@ -725,6 +760,7 @@ impl Queue {
             sweep_grace: Duration::from_secs(5),
             sweep_batch_size: 500,
             migration_lock_timeout: Duration::from_secs(30),
+            notify_throttle: None,
         }
     }
 
@@ -781,7 +817,7 @@ impl Queue {
     /// A dedupe-key collision returns the existing live job's id.
     #[cfg(feature = "_test")]
     pub async fn enqueue_raw(&self, job: JobRequest) -> Result<EnqueueResult<Uuid>, Error> {
-        raw_enqueue_result(self.database.enqueue_raw_delayed_result(job, None).await?)
+        raw_enqueue_result(self.database.enqueue_raw_delayed_result(job, None, false).await?)
     }
 
     /// Enqueues an untyped job inside a caller-owned transaction. Test-only,
@@ -803,7 +839,7 @@ impl Queue {
         transaction: &mut sqlx::PgTransaction<'_>,
         job: JobRequest,
     ) -> Result<EnqueueResult<Uuid>, Error> {
-        raw_enqueue_result(self.database.enqueue_raw_delayed_in_result(transaction, job, None).await?)
+        raw_enqueue_result(self.database.enqueue_raw_delayed_in_result(transaction, job, None, false).await?)
     }
 
     /// Requests an abort. Queued jobs finish as `aborted` immediately; running
@@ -817,6 +853,21 @@ impl Queue {
     /// missing, or an abort is already pending).
     pub async fn abort_job(&self, job_id: Uuid, reason: &str) -> Result<bool, Error> {
         self.database.abort(job_id, reason).await
+    }
+
+    /// Deletes up to `limit` queued jobs from this queue, oldest due first,
+    /// and returns how many were deleted. `name` narrows the purge to one job
+    /// name. Loop until it returns zero to empty the queue.
+    ///
+    /// An operator's tool for the enqueue that should not have happened — a
+    /// bad deploy's fan-out, a runaway producer — rather than part of any
+    /// normal flow: purged jobs simply vanish, with no terminal row, no
+    /// completion notification, and no attempt spent. A caller waiting on one
+    /// observes it as a missing job. Scheduled jobs are queued jobs and are
+    /// purged too; running attempts are never touched, and a row a claim is
+    /// locking at that instant is skipped rather than waited for.
+    pub async fn purge_queued_jobs(&self, name: Option<&str>, limit: u32) -> Result<u64, Error> {
+        self.database.purge_queued_jobs(name, limit).await
     }
 
     /// Creates a fresh occurrence of a terminal job with one more attempt.

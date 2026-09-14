@@ -36,6 +36,10 @@ use crate::queue::{Queue, QueueDoneEvent};
 pub const MAX_DURATION_MS: u64 = 3_153_600_000_000;
 const MAX_DURATION: Duration = Duration::from_millis(MAX_DURATION_MS);
 
+/// Seven days: long enough for a failure that happened over a weekend to
+/// still be on the dashboard, and to be retried from it, on Monday.
+pub(crate) const DEFAULT_FAILED_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 /// PostgreSQL's `timestamptz` floor — `4714-11-24 00:00:00 BC` UTC.
 ///
 /// There is deliberately no matching ceiling: PostgreSQL's is 294277 AD, which
@@ -82,7 +86,10 @@ pub(crate) fn retry_delay_for(retry_delay_ms: i64, backoff: &JobRetryBackoff, at
     backoff.next_delay(base, attempts.max(0) as u32)
 }
 
-/// How long a finished job's row (and result) is kept.
+/// How long a finished job's row is kept. A job carries one of these for a
+/// `complete` finish ([`JobConfig::retention`], which keeps the result) and one
+/// for a `failed` or `aborted` finish ([`JobConfig::failed_retention`], which
+/// keeps the error).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobRetention {
     /// Keep the row for this long after it finishes, then the sweeper purges it.
@@ -280,8 +287,17 @@ pub struct JobConfig {
     /// timed out: accepting it would make the deadline advisory, and by then the
     /// sweeper may already have adjudicated the attempt stuck.
     pub timeout: Option<Duration>,
-    /// How long the finished row is retained.
+    /// How long the row is retained after a `complete` finish.
     pub retention: JobRetention,
+    /// How long the row is retained after a `failed` or `aborted` finish.
+    ///
+    /// Separate from [`JobConfig::retention`] because the two are read at
+    /// different times: a result is collected within moments by whoever
+    /// waited for it, while a failure is investigated by an operator after
+    /// the fact. Under one shared clock the default that suits results
+    /// purged every failure before anyone looked, and
+    /// [`Queue::retry_job`] then had no row left to retry.
+    pub failed_retention: JobRetention,
     /// Base delay before a retry.
     pub retry_delay: Duration,
     /// How the retry delay grows across attempts.
@@ -304,6 +320,9 @@ impl JobConfig {
         if let JobRetention::For(ttl) = self.retention {
             validate_duration("job retention", ttl)?;
         }
+        if let JobRetention::For(ttl) = self.failed_retention {
+            validate_duration("job failed retention", ttl)?;
+        }
         validate_duration("job retry delay", self.retry_delay)?;
         if let JobRetryBackoff::Exponential { max: Some(max) } = self.backoff {
             validate_nonzero_duration("job backoff maximum", max)?;
@@ -316,13 +335,14 @@ impl JobConfig {
 }
 
 impl Default for JobConfig {
-    /// 1 attempt, 10s timeout, 10min result retention, immediate retries,
-    /// priority 0.
+    /// 1 attempt, 10s timeout, 10min result retention, 7-day failure
+    /// retention, immediate retries, priority 0.
     fn default() -> Self {
         Self {
             max_attempts: 1,
             timeout: Some(Duration::from_secs(10)),
             retention: JobRetention::For(Duration::from_secs(600)),
+            failed_retention: JobRetention::For(DEFAULT_FAILED_RETENTION),
             retry_delay: Duration::ZERO,
             backoff: JobRetryBackoff::None,
             priority: 0,
@@ -786,6 +806,9 @@ pub struct JobRow {
     pub backoff: JobRetryBackoff,
     /// Result retention in milliseconds (`NULL` forever, `0` delete now).
     pub result_ttl_ms: Option<i64>,
+    /// Retention after a `failed` or `aborted` finish, in milliseconds, with
+    /// the same encoding as `result_ttl_ms`.
+    pub failed_ttl_ms: Option<i64>,
     /// Earliest execution time.
     #[sqlx(try_from = "jiff_sqlx::Timestamp")]
     pub scheduled_at: Timestamp,
@@ -841,9 +864,14 @@ impl JobRow {
         self.timeout_ms.filter(|ms| *ms > 0).map(|ms| Duration::from_millis(ms as u64))
     }
 
-    /// Result retention policy.
+    /// Retention policy after a `complete` finish.
     pub fn retention(&self) -> JobRetention {
         JobRetention::from_result_ttl_ms(self.result_ttl_ms)
+    }
+
+    /// Retention policy after a `failed` or `aborted` finish.
+    pub fn failed_retention(&self) -> JobRetention {
+        JobRetention::from_result_ttl_ms(self.failed_ttl_ms)
     }
 
     /// Delay before the next retry attempt, applying this job's backoff.
@@ -1485,6 +1513,7 @@ impl JobCronEntry {
             "max_attempts": template.config.max_attempts,
             "timeout_ms": template.config.timeout.map(duration_to_ms),
             "result_ttl_ms": template.config.retention.as_result_ttl_ms(),
+            "failed_ttl_ms": template.config.failed_retention.as_result_ttl_ms(),
             "retry_delay_ms": duration_to_ms(template.config.retry_delay),
             "backoff": template.config.backoff,
             "priority": template.config.priority,
@@ -2033,6 +2062,39 @@ pub(crate) fn json_contains_nul(value: &Value) -> bool {
 /// store the blob elsewhere and enqueue a reference.
 pub(crate) const MAX_JSON_DOCUMENT_BYTES: usize = 1_048_576;
 
+/// The most jobs one [`Queue::enqueue_batch`] accepts.
+pub const MAX_ENQUEUE_BATCH_JOBS: usize = 1_000;
+
+/// The most serialized payload and metadata, in bytes, one
+/// [`Queue::enqueue_batch`] accepts across all of its jobs. Together with
+/// [`MAX_ENQUEUE_BATCH_JOBS`] this keeps the batch's one statement well under
+/// the gigabyte PostgreSQL accepts in a single protocol message: every other
+/// parameter of that statement is small, and a batch of the largest documents
+/// [`JobRequest::validate`] admits would otherwise reach twice the limit.
+pub const MAX_ENQUEUE_BATCH_BYTES: usize = 256 * 1_048_576;
+
+/// The serialized size of `value` in bytes, counted rather than allocated.
+/// Bounded by its caller the way [`json_exceeds_bytes`] is: the depth check
+/// has already run, so serialization cannot recurse past [`MAX_JSON_DEPTH`].
+pub(crate) fn json_byte_len(value: &Value) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    // A `Value` cannot fail to serialize and the counter never refuses a
+    // byte, so there is no error to report; the count is the answer.
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.0
+}
+
 /// The most UTF-8 data stored in a job's `error` column, including its error-kind prefix.
 pub(crate) const MAX_STORED_ERROR_BYTES: usize = MAX_JSON_DOCUMENT_BYTES;
 
@@ -2318,9 +2380,16 @@ impl<J: JobType> JobBuilder<J> {
         self
     }
 
-    /// Overrides how long the finished row is retained.
+    /// Overrides how long the row is retained after a `complete` finish.
     pub fn retention(mut self, retention: JobRetention) -> Self {
         self.config.retention = retention;
+        self
+    }
+
+    /// Overrides how long the row is retained after a `failed` or `aborted`
+    /// finish.
+    pub fn failed_retention(mut self, retention: JobRetention) -> Self {
+        self.config.failed_retention = retention;
         self
     }
 
@@ -2442,9 +2511,55 @@ impl Queue {
     /// twice — pass a [`JobBuilder::dedupe_key`] when the caller retries.
     pub async fn enqueue<J: JobType>(&self, job: JobBuilder<J>) -> Result<EnqueueResult<JobHandle<J>>, Error> {
         let (new_job, delay) = job.into_parts()?;
-        let retention = new_job.config.retention;
-        let result = self.database().enqueue_raw_delayed_result(new_job, delay).await?;
-        typed_enqueue_result::<J>(self, result, retention)
+        let retentions = new_job.config.retentions();
+        let result = self.database().enqueue_raw_delayed_result(new_job, delay, false).await?;
+        typed_enqueue_result::<J>(self, result, retentions)
+    }
+
+    /// Enqueues jobs of one type as a batch: one statement, one round trip,
+    /// and at most one wakeup notification for the whole batch, where
+    /// [`Queue::enqueue`] pays for each of those per job.
+    ///
+    /// Results come back in input order. A job whose dedupe key is held by a
+    /// live job, or by an earlier job in the same batch, is reported as
+    /// [`EnqueueResult::Deduplicated`] with a handle to that holder, exactly
+    /// as [`Queue::enqueue`] reports it. A key held by a job of a *different*
+    /// type fails the whole call, and nothing from the batch is published. The
+    /// locks are the ones a single keyed enqueue takes, acquired in lock order,
+    /// so a batch cannot deadlock with another batch or with single enqueues
+    /// of the same keys.
+    ///
+    /// A batch is bounded by [`MAX_ENQUEUE_BATCH_JOBS`] jobs and
+    /// [`MAX_ENQUEUE_BATCH_BYTES`] of serialized payload and metadata, which
+    /// keeps the statement under PostgreSQL's message-size limit; a larger
+    /// batch is refused as [`Error::Config`] before anything is sent. An
+    /// empty batch inserts nothing and returns an empty vector.
+    ///
+    /// As with [`Queue::enqueue`], an `Err` after validation leaves the
+    /// publish indeterminate rather than proving it did not happen.
+    pub async fn enqueue_batch<J: JobType>(
+        &self,
+        jobs: impl IntoIterator<Item = JobBuilder<J>>,
+    ) -> Result<Vec<EnqueueResult<JobHandle<J>>>, Error> {
+        let batch = jobs.into_iter().map(JobBuilder::into_parts).collect::<Result<Vec<_>, _>>()?;
+        let retentions = batch.iter().map(|(job, _)| job.config.retentions()).collect::<Vec<_>>();
+        let results = self.database().enqueue_batch_result(batch).await?;
+        typed_batch_results::<J>(self, results, retentions)
+    }
+
+    /// [`Queue::enqueue_batch`] inside a caller-owned transaction, with
+    /// [`Queue::enqueue_in`]'s visibility and locking rules. An error after
+    /// validation can leave rows of this batch inserted in the transaction, as
+    /// any failed statement inside one can; roll the transaction back.
+    pub async fn enqueue_batch_in<J: JobType>(
+        &self,
+        transaction: &mut sqlx::PgTransaction<'_>,
+        jobs: impl IntoIterator<Item = JobBuilder<J>>,
+    ) -> Result<Vec<EnqueueResult<JobHandle<J>>>, Error> {
+        let batch = jobs.into_iter().map(JobBuilder::into_parts).collect::<Result<Vec<_>, _>>()?;
+        let retentions = batch.iter().map(|(job, _)| job.config.retentions()).collect::<Vec<_>>();
+        let results = self.database().enqueue_batch_in_result(transaction, batch).await?;
+        typed_batch_results::<J>(self, results, retentions)
     }
 
     /// Enqueues a typed job as part of a caller-owned PostgreSQL transaction.
@@ -2467,9 +2582,9 @@ impl Queue {
         job: JobBuilder<J>,
     ) -> Result<EnqueueResult<JobHandle<J>>, Error> {
         let (new_job, delay) = job.into_parts()?;
-        let retention = new_job.config.retention;
-        let result = self.database().enqueue_raw_delayed_in_result(transaction, new_job, delay).await?;
-        typed_enqueue_result::<J>(self, result, retention)
+        let retentions = new_job.config.retentions();
+        let result = self.database().enqueue_raw_delayed_in_result(transaction, new_job, delay, false).await?;
+        typed_enqueue_result::<J>(self, result, retentions)
     }
 
     /// Enqueues a job and waits for its typed result (request/response).
@@ -2479,7 +2594,11 @@ impl Queue {
     /// [`Error::Job`]; `None` timeout waits forever.
     ///
     /// The job's retention must keep the row around long enough to read the
-    /// result. `JobRetention::DeleteImmediately` is rejected before enqueue.
+    /// outcome, whichever it is: `JobRetention::DeleteImmediately` for either
+    /// the result or the failure is rejected before enqueue.
+    ///
+    /// The job is inserted already marked as awaited, so its finish emits the
+    /// completion notification this wait resolves on without a second write.
     ///
     /// As with [`Queue::enqueue`], an `Err` leaves the publish indeterminate
     /// rather than proving it did not happen.
@@ -2489,26 +2608,28 @@ impl Queue {
         timeout: Option<Duration>,
     ) -> Result<J::Output, Error> {
         let (new_job, delay) = job.into_parts()?;
-        if new_job.config.retention == JobRetention::DeleteImmediately {
+        let retentions = new_job.config.retentions();
+        if retentions.deletes_immediately() {
             return Err(Error::Config(
-                "enqueue_and_wait requires result retention; DeleteImmediately removes the result before it can be read"
+                "enqueue_and_wait requires retention for both outcomes; DeleteImmediately removes the row before its \
+                 result or error can be read"
                     .into(),
             ));
         }
-        let retention = new_job.config.retention;
-        let handle: JobHandle<J> = match self.database().enqueue_raw_delayed_result(new_job, delay).await? {
-            DatabaseEnqueueResult::Inserted(id) => JobHandle::new(id, self.clone(), retention),
-            DatabaseEnqueueResult::Deduplicated { id, name, retention } => {
-                if retention == JobRetention::DeleteImmediately {
+        let handle: JobHandle<J> = match self.database().enqueue_raw_delayed_result(new_job, delay, true).await? {
+            DatabaseEnqueueResult::Inserted(id) => JobHandle::new(id, self.clone(), retentions, true),
+            DatabaseEnqueueResult::Deduplicated { id, name, retentions } => {
+                if retentions.deletes_immediately() {
                     return Err(Error::Config(
-                        "enqueue_and_wait cannot wait on the existing deduplicated job because it deletes its result immediately"
+                        "enqueue_and_wait cannot wait on the existing deduplicated job because it deletes its row \
+                         immediately on one of its outcomes"
                             .into(),
                     ));
                 }
                 if name != J::NAME {
                     return Err(Error::Config(format!("dedupe key belongs to job {name:?}, not {:?}", J::NAME)));
                 }
-                JobHandle::new(id, self.clone(), retention)
+                JobHandle::new(id, self.clone(), retentions, false)
             }
         };
         handle.wait(timeout).await
@@ -2518,18 +2639,56 @@ impl Queue {
 fn typed_enqueue_result<J: JobType>(
     queue: &Queue,
     result: DatabaseEnqueueResult,
-    inserted_retention: JobRetention,
+    inserted_retentions: JobRetentions,
 ) -> Result<EnqueueResult<JobHandle<J>>, Error> {
     match result {
         DatabaseEnqueueResult::Inserted(id) => {
-            Ok(EnqueueResult::Enqueued(JobHandle::new(id, queue.clone(), inserted_retention)))
+            Ok(EnqueueResult::Enqueued(JobHandle::new(id, queue.clone(), inserted_retentions, false)))
         }
-        DatabaseEnqueueResult::Deduplicated { id, name, retention } => {
+        DatabaseEnqueueResult::Deduplicated { id, name, retentions } => {
             if name != J::NAME {
                 return Err(Error::Config(format!("dedupe key belongs to job {name:?}, not {:?}", J::NAME)));
             }
-            Ok(EnqueueResult::Deduplicated(JobHandle::new(id, queue.clone(), retention)))
+            Ok(EnqueueResult::Deduplicated(JobHandle::new(id, queue.clone(), retentions, false)))
         }
+    }
+}
+
+/// [`typed_enqueue_result`] over a batch, pairing each result with the
+/// retention the request it answers was enqueued with.
+fn typed_batch_results<J: JobType>(
+    queue: &Queue,
+    results: Vec<DatabaseEnqueueResult>,
+    retentions: Vec<JobRetentions>,
+) -> Result<Vec<EnqueueResult<JobHandle<J>>>, Error> {
+    results
+        .into_iter()
+        .zip(retentions)
+        .map(|(result, retentions)| typed_enqueue_result::<J>(queue, result, retentions))
+        .collect()
+}
+
+/// The pair of retention policies a job carries, as the enqueue paths hand
+/// them to the [`JobHandle`] they return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JobRetentions {
+    /// After a `complete` finish.
+    pub(crate) result: JobRetention,
+    /// After a `failed` or `aborted` finish.
+    pub(crate) failed: JobRetention,
+}
+
+impl JobRetentions {
+    /// Whether either outcome leaves no row to read: a wait needs both to be
+    /// durable, because it does not know in advance which one it will get.
+    pub(crate) fn deletes_immediately(self) -> bool {
+        self.result == JobRetention::DeleteImmediately || self.failed == JobRetention::DeleteImmediately
+    }
+}
+
+impl JobConfig {
+    pub(crate) fn retentions(&self) -> JobRetentions {
+        JobRetentions { result: self.retention, failed: self.failed_retention }
     }
 }
 
@@ -2538,13 +2697,16 @@ fn typed_enqueue_result<J: JobType>(
 pub struct JobHandle<J: JobType> {
     pub(crate) id: Uuid,
     pub(crate) queue: Queue,
-    pub(super) retention: JobRetention,
+    pub(super) retentions: JobRetentions,
+    /// Whether the row is already marked awaited, so a wait can skip the
+    /// write that registers its interest in the completion notification.
+    awaited: bool,
     _job: PhantomData<fn() -> J>,
 }
 
 impl<J: JobType> JobHandle<J> {
-    fn new(id: Uuid, queue: Queue, retention: JobRetention) -> Self {
-        Self { id, queue, retention, _job: PhantomData }
+    fn new(id: Uuid, queue: Queue, retentions: JobRetentions, awaited: bool) -> Self {
+        Self { id, queue, retentions, awaited, _job: PhantomData }
     }
 
     /// The job's id (UUIDv7).
@@ -2585,7 +2747,7 @@ impl<J: JobType> JobHandle<J> {
     }
 
     async fn wait_value_inner(&self) -> Result<Value, Error> {
-        if self.retention == JobRetention::DeleteImmediately {
+        if self.retentions.deletes_immediately() {
             // Queued aborts intentionally remain until sweep, so a caller that
             // already aborted may still read that terminal result. Running or
             // deleted rows cannot provide a reliable result.
@@ -2595,7 +2757,7 @@ impl<J: JobType> JobHandle<J> {
                 return resolve(outcome);
             }
             return Err(Error::Config(
-                "wait requires result retention; DeleteImmediately jobs have no durable result".into(),
+                "wait requires retention for both outcomes; a DeleteImmediately job has no durable row to read".into(),
             ));
         }
         self.wait_inner().await
@@ -2617,6 +2779,24 @@ impl<J: JobType> JobHandle<J> {
         // push-based.
         const INITIAL_POLL_INTERVAL: Duration = Duration::from_millis(250);
         const MAX_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+        // Register interest before subscribing: a finish emits its completion
+        // notification only for a row marked awaited, so every finish that
+        // lands after this write is pushed, and one that landed before it is
+        // caught by the first poll below. The write is skipped for a handle
+        // whose enqueue already set the flag. A write that fails is a lost
+        // registration, not a lost wait — the poll loop resolves the job at
+        // its own cadence, exactly as it does while the listener is down —
+        // except on a closed pool, which the poll gives up on too.
+        if !self.awaited {
+            match self.queue.database().mark_awaited(self.id).await {
+                Ok(()) => {}
+                Err(error @ Error::Db(sqlx::Error::PoolClosed)) => return Err(error),
+                Err(error) => {
+                    tracing::warn!(job.id = %self.id, %error, "could not register for the completion notification; polling");
+                }
+            }
+        }
 
         // Subscribe before the first status check so a finish landing in
         // between can't be missed. The listener needs its own connection

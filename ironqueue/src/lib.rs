@@ -111,7 +111,7 @@ pub use job::JobRequest;
 pub use job::{
     CronDefinition, CronMisfirePolicy, CronOptions, EnqueueResult, FromJobContext, JobBuilder, JobConfig, JobContext,
     JobCursor, JobDefinition, JobError, JobErrorKind, JobFilter, JobHandle, JobRetention, JobRetryBackoff, JobRow,
-    JobState, JobStatus, JobType,
+    JobState, JobStatus, JobType, MAX_ENQUEUE_BATCH_BYTES, MAX_ENQUEUE_BATCH_JOBS,
 };
 pub use queue::{Attempt, Consumer, Queue, QueueBuilder, QueueCounts, QueueStats};
 pub use sweeper::{SweepOperations, Sweeper, SweeperReport};
@@ -230,8 +230,12 @@ pub use ironqueue_macros::cron;
 ///   until the handler yields, which is why workers belong on the multi-thread runtime. A handler
 ///   already holding a finished result when the deadline is checked keeps that result rather than
 ///   a synthetic timeout.
-/// - `result_ttl_ms = N` (default `600_000`) — how long a finished job's row is retained. `0`
-///   deletes it as it finishes.
+/// - `result_ttl_ms = N` (default `600_000`) — how long a completed job's row, with its result, is
+///   retained. `0` deletes it as it finishes.
+/// - `failed_ttl_ms = N` (default `604_800_000`, seven days) — how long a failed or aborted job's
+///   row, with its error, is retained. A separate clock from `result_ttl_ms` because failures are
+///   looked at later than results: with one shared clock, the minutes that suit a result purged
+///   every failure before an operator saw it. `0` deletes the row as it finishes.
 /// - `retry_delay_ms = N` (default `0`) — base delay before a retry.
 /// - `max_backoff_ms = N` (default: disabled) — exponential backoff capped at `N`. Requires a
 ///   non-zero `retry_delay_ms`.
@@ -342,6 +346,11 @@ pub mod __test_support {
     /// Returns the completion channel used by a queue.
     pub fn done_channel(queue: &str) -> String {
         crate::database::done_channel(queue)
+    }
+
+    /// Returns the wakeup channel a queue's enqueues notify on.
+    pub fn notify_channel(queue: &str) -> String {
+        crate::database::channel_name(queue, "")
     }
 
     /// Returns the advisory-lock namespace used by dedupe enqueues.

@@ -3632,6 +3632,7 @@ pub(crate) struct DashboardJobSummaryRow {
     pub retry_delay_ms: i64,
     pub backoff: JobRetryBackoff,
     pub result_ttl_ms: Option<i64>,
+    pub failed_ttl_ms: Option<i64>,
     #[sqlx(try_from = "jiff_sqlx::Timestamp")]
     pub scheduled_at: Timestamp,
     #[sqlx(try_from = "jiff_sqlx::Timestamp")]
@@ -3729,6 +3730,7 @@ struct DashboardJobRecord {
     retry_delay_ms: i64,
     backoff: JobRetryBackoff,
     result_ttl_ms: Option<i64>,
+    failed_ttl_ms: Option<i64>,
     #[sqlx(try_from = "jiff_sqlx::Timestamp")]
     scheduled_at: Timestamp,
     #[sqlx(try_from = "jiff_sqlx::Timestamp")]
@@ -3786,6 +3788,7 @@ impl From<DashboardJobRecord> for DashboardJobRow {
                 retry_delay_ms: row.retry_delay_ms,
                 backoff: row.backoff,
                 result_ttl_ms: row.result_ttl_ms,
+                failed_ttl_ms: row.failed_ttl_ms,
                 scheduled_at: row.scheduled_at,
                 enqueued_at: row.enqueued_at,
                 started_at: row.started_at,
@@ -4069,6 +4072,7 @@ macro_rules! job_page_sql {
                 jobs.retry_delay_ms,
                 jobs.backoff,
                 jobs.result_ttl_ms,
+                jobs.failed_ttl_ms,
                 jobs.scheduled_at,
                 jobs.enqueued_at,
                 jobs.started_at,
@@ -4208,6 +4212,7 @@ impl Database {
                 retry_delay_ms,
                 backoff,
                 result_ttl_ms,
+                failed_ttl_ms,
                 scheduled_at,
                 enqueued_at,
                 started_at,

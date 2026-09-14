@@ -838,6 +838,17 @@ fn config_setters(attrs: &JobAttrs, runtime: &TokenStream) -> Vec<TokenStream> {
             }
         });
     }
+    if let Some(ttl) = &attrs.failed_ttl_ms {
+        setters.push(match ttl {
+            ResultTtl::ForMs(ms) => quote! {
+                __config.failed_retention =
+                    #runtime::JobRetention::For(::core::time::Duration::from_millis(#ms));
+            },
+            ResultTtl::Delete => {
+                quote!(__config.failed_retention = #runtime::JobRetention::DeleteImmediately;)
+            }
+        });
+    }
     if let Some(ms) = attrs.retry_delay_ms {
         setters.push(quote!(__config.retry_delay = ::core::time::Duration::from_millis(#ms);));
     }

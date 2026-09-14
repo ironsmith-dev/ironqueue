@@ -8,7 +8,7 @@ struct Payload {
     value: u32,
 }
 
-#[ironqueue::job(max_attempts = 3, timeout_ms = 30_000, priority = -1)]
+#[ironqueue::job(max_attempts = 3, timeout_ms = 30_000, failed_ttl_ms = 86_400_000, priority = -1)]
 async fn work(args: Payload, db: JobState<Db>, ctx: JobContext) -> anyhow::Result<u32> {
     let (_, _) = (db, ctx);
     Ok(args.value)

@@ -1955,6 +1955,7 @@ mod worker_intake_tests {
             retry_delay_ms: 0,
             backoff: JobRetryBackoff::None,
             result_ttl_ms: None,
+            failed_ttl_ms: None,
             scheduled_at: Timestamp::now(),
             enqueued_at: Timestamp::now(),
             started_at: None,

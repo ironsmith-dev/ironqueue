@@ -6,7 +6,7 @@ Async and cron jobs for Rust, backed by PostgreSQL 18+.
 
 - Turn async functions into background jobs with `#[ironqueue::job]`.
 - Schedule cron jobs with `#[ironqueue::cron]`.
-- Retry, delay, prioritize, deduplicate, and wait for jobs.
+- Retry, delay, prioritize, deduplicate, batch, and wait for jobs.
 - Inspect queues, workers, and jobs in the built-in dashboard.
 
 ## Quick Start
@@ -66,6 +66,8 @@ pub struct Receipt {
     timeout_ms = 30_000,
     // Result retention in milliseconds (optional; default: 600,000; 0 deletes immediately).
     result_ttl_ms = 3_600_000,
+    // Retention of a failed or aborted job in milliseconds (optional; default: 604,800,000; 0 deletes immediately).
+    failed_ttl_ms = 86_400_000,
     // Base retry delay in milliseconds (optional; default: 0).
     retry_delay_ms = 500,
     // Max exponential backoff in milliseconds (optional; default: disabled).
@@ -121,6 +123,11 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     println!("receipt for: {}", receipt.address);
 
+    // Enqueue many jobs in one statement, with one worker wakeup for the whole batch.
+    let batch = (3..=5).map(|n| send_email::job(Email { address: format!("user{n}@example.com") }));
+    let results = queue.enqueue_batch(batch).await?;
+    println!("enqueued {} jobs", results.len());
+
     Ok(())
 }
 ```
@@ -149,6 +156,8 @@ use ironqueue::{JobContext, Queue, Worker};
     timeout_ms = 120_000,
     // Result retention in milliseconds (optional; default: 600,000; 0 deletes immediately).
     result_ttl_ms = 604_800_000,
+    // Retention of a failed or aborted job in milliseconds (optional; default: 604,800,000; 0 deletes immediately).
+    failed_ttl_ms = 2_592_000_000,
     // Base retry delay in milliseconds (optional; default: 0).
     retry_delay_ms = 1_000,
     // Max exponential backoff in milliseconds (optional; default: disabled).
@@ -238,7 +247,20 @@ async fn main() -> anyhow::Result<()> {
 - Cron revisions only move forward. Old workers briefly report degraded scheduler health during a rolling deployment.
   After a rollback, recover by deploying the old definition under a revision higher than the stored one.
 - Job payloads, job results, job metadata, worker stats, and worker metadata are each limited to 1 MiB of serialized
-  JSON. IronQueue rejects oversized documents before writing anything.
+  JSON. IronQueue rejects oversized documents before writing anything. A batch is limited to 1,000 jobs and 256 MiB of
+  serialized payloads and metadata.
+- Finished jobs are retained on two clocks: `result_ttl_ms` after a job completes, and `failed_ttl_ms` after it fails
+  or is aborted. The failure clock defaults to seven days, so an operator can still inspect a failure and retry it from
+  the dashboard days later. `Queue::retry_job` needs the row to still exist.
+- Workers wake up through `NOTIFY`, and PostgreSQL commits notifying transactions one at a time, cluster-wide. IronQueue
+  therefore notifies only for jobs that are due now, and only for completions that a caller waits on. Bulk producers
+  can go further with `Queue::enqueue_batch`, which sends one statement and one wakeup per batch, or with
+  `QueueBuilder::notify_throttle`, which limits a producer to one wakeup per window at the cost of wakeup latency up to
+  the workers' poll interval.
+- `Queue::counts` reports queue depth and when the oldest ready job became due, which is the backlog latency to alert
+  on. The `pg_monitor` role can read every IronQueue table, so a metrics exporter needs no custom grant.
+- `Queue::purge_queued_jobs` deletes queued jobs in bounded batches, optionally by job name, to clean up after a bad
+  deploy. It never touches running attempts.
 - Every queue connection checks IronQueue's migration history and applies missing migrations automatically. A current
   history only needs read access to `ironqueue.migrations`; it does not run DDL or take the migrator's advisory lock.
   Migration history does not detect or repair a table, index, or other object changed manually after its migration ran.

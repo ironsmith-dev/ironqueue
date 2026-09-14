@@ -28,7 +28,7 @@ error: exponential backoff requires retry_delay_ms greater than zero
 13 | #[ironqueue::job(max_backoff_ms = 1)]
    |                  ^^^^^^^^^^^^^^
 
-error: unknown attribute `max_attempt`; expected one of: name, max_attempts, timeout_ms, result_ttl_ms, retry_delay_ms, max_backoff_ms, priority
+error: unknown attribute `max_attempt`; expected one of: name, max_attempts, timeout_ms, result_ttl_ms, failed_ttl_ms, retry_delay_ms, max_backoff_ms, priority
   --> tests/macros/fail.rs:16:18
    |
 16 | #[ironqueue::job(max_attempt = 3)]

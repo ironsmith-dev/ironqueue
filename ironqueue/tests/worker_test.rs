@@ -2719,11 +2719,14 @@ async fn test_abort_loop_cancels_handler_when_swept_row_is_deleted_before_observ
     let shutdown = CancellationToken::new();
     let run = tokio::spawn(worker.run_until(shutdown.clone()));
 
+    // The sweeper finishes the row `aborted`, so the failure retention is the
+    // one that deletes it.
     for (tag, retention) in [
         (1, JobRetention::DeleteImmediately),
         (2, JobRetention::For(Duration::from_millis(1))),
     ] {
-        let handle = db.queue.enqueue(waits_after_row_deletion::job(tag).retention(retention)).await.unwrap().unwrap();
+        let handle =
+            db.queue.enqueue(waits_after_row_deletion::job(tag).failed_retention(retention)).await.unwrap().unwrap();
         assert_eq!(tokio::time::timeout(Duration::from_secs(3), started_rx.recv()).await.unwrap(), Some(tag));
         wait_until(
             Duration::from_secs(3),

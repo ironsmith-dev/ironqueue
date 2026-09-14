@@ -1,6 +1,8 @@
 //! PostgreSQL persistence shared by queues, workers, and the dashboard.
 
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use jiff::{SignedDuration, Timestamp};
 use jiff_sqlx::ToSqlx;
@@ -14,9 +16,9 @@ use uuid::Uuid;
 
 use crate::Error;
 use crate::job::{
-    CronMisfirePolicy, JobCronEntry, JobCursor, JobRequest, JobRetention, JobRetryBackoff, JobRow, JobStatus,
-    duration_to_ms, duration_to_ms_checked, truncate_stored_error, validate_duration, validate_json_document,
-    validate_nonzero_duration,
+    CronMisfirePolicy, JobCronEntry, JobCursor, JobRequest, JobRetention, JobRetentions, JobRetryBackoff, JobRow,
+    JobStatus, MAX_ENQUEUE_BATCH_BYTES, MAX_ENQUEUE_BATCH_JOBS, duration_to_ms, duration_to_ms_checked, json_byte_len,
+    truncate_stored_error, validate_duration, validate_json_document, validate_nonzero_duration,
 };
 use crate::queue::{QueueCounters, QueueCounts, QueueNotifyListener, QueueStats};
 use crate::sweeper::{SWEPT, Sweeper, is_swept_marked, swept_marker};
@@ -365,7 +367,7 @@ pub(crate) fn stable_hash(bytes: impl IntoIterator<Item = u8>) -> u64 {
     bytes.into_iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3))
 }
 
-fn channel_name(queue: &str, suffix: &str) -> String {
+pub(crate) fn channel_name(queue: &str, suffix: &str) -> String {
     let full = format!("ironqueue_{queue}{suffix}");
     // Hash the queue and suffix NUL-separated (queue names reject control
     // characters) so a queue named "{x}_done" cannot share a channel with
@@ -472,7 +474,19 @@ pub(crate) struct Database {
     done_channel: String,
     counters: std::sync::Arc<QueueCounters>,
     notify_listener: std::sync::OnceLock<QueueNotifyListener>,
+    /// The enqueue wakeup throttle: at most one notification per window from
+    /// this handle, or every one when `None`.
+    notify_throttle: Option<Duration>,
+    /// When the throttle last let a notification through, in milliseconds on
+    /// `notify_clock`; [`NEVER_NOTIFIED`] until the first.
+    last_notify_ms: AtomicU64,
+    notify_clock: Instant,
 }
+
+/// The `last_notify_ms` value before any notification has been sent. A zero
+/// would read as "sent at the clock's origin" and suppress every wakeup for
+/// the first window after connecting.
+const NEVER_NOTIFIED: u64 = u64::MAX;
 
 pub(crate) struct DatabaseConnectOptions {
     pub(crate) url: String,
@@ -484,11 +498,12 @@ pub(crate) struct DatabaseConnectOptions {
     pub(crate) sweep_grace: Duration,
     pub(crate) sweep_batch_size: u32,
     pub(crate) migration_lock_timeout: Duration,
+    pub(crate) notify_throttle: Option<Duration>,
 }
 
 pub(crate) enum DatabaseEnqueueResult {
     Inserted(Uuid),
-    Deduplicated { id: Uuid, name: String, retention: JobRetention },
+    Deduplicated { id: Uuid, name: String, retentions: JobRetentions },
 }
 
 /// The one live row holding a dedupe key, as both readers of that rule need it:
@@ -504,9 +519,28 @@ pub(crate) struct DatabaseDedupeHolder {
     pub(crate) id: Uuid,
     pub(crate) name: String,
     pub(crate) result_ttl_ms: Option<i64>,
+    pub(crate) failed_ttl_ms: Option<i64>,
     #[sqlx(try_from = "jiff_sqlx::Timestamp")]
     pub(crate) scheduled_at: Timestamp,
     pub(crate) kind: String,
+}
+
+impl DatabaseDedupeHolder {
+    fn retentions(&self) -> JobRetentions {
+        JobRetentions {
+            result: JobRetention::from_result_ttl_ms(self.result_ttl_ms),
+            failed: JobRetention::from_result_ttl_ms(self.failed_ttl_ms),
+        }
+    }
+}
+
+/// A live dedupe holder together with the key it holds, for the batch enqueue,
+/// which reads every holder of a batch's keys in one statement.
+#[derive(sqlx::FromRow)]
+struct DatabaseKeyedDedupeHolder {
+    dedupe_key: String,
+    #[sqlx(flatten)]
+    holder: DatabaseDedupeHolder,
 }
 
 pub(crate) enum DatabaseCronAuthority {
@@ -635,11 +669,37 @@ struct DatabaseDequeueProbe {
 
 /// The collision answer for a dedupe key an existing live job holds.
 fn deduplicated(row: DatabaseDedupeHolder) -> DatabaseEnqueueResult {
-    DatabaseEnqueueResult::Deduplicated {
-        id: row.id,
-        name: row.name,
-        retention: JobRetention::from_result_ttl_ms(row.result_ttl_ms),
+    DatabaseEnqueueResult::Deduplicated { id: row.id, retentions: row.retentions(), name: row.name }
+}
+
+/// Everything a batch enqueue refuses before it takes a connection, over and
+/// above [`validate_enqueue`] per job: the two bounds that keep one statement
+/// under PostgreSQL's message-size limit. Measured here rather than at the
+/// write for the reason `JobRequest::validate` gives — inside a caller's
+/// transaction the protocol error would abort their whole unit of work, and
+/// outside one it would answer a permanently oversized batch with a
+/// transient-looking `Error::Db`.
+fn validate_batch(batch: &[(JobRequest, Option<Duration>)]) -> Result<(), Error> {
+    if batch.len() > MAX_ENQUEUE_BATCH_JOBS {
+        return Err(Error::Config(format!(
+            "enqueue batch of {} jobs exceeds the maximum of {MAX_ENQUEUE_BATCH_JOBS}",
+            batch.len()
+        )));
     }
+    let mut bytes = 0usize;
+    for (job, delay) in batch {
+        validate_enqueue(job, *delay)?;
+        // Bounded: `validate_enqueue` refused any document nested past the
+        // depth the serializer can walk.
+        bytes = bytes.saturating_add(json_byte_len(&job.payload)).saturating_add(json_byte_len(&job.meta));
+        if bytes > MAX_ENQUEUE_BATCH_BYTES {
+            return Err(Error::Config(format!(
+                "enqueue batch exceeds the maximum of {MAX_ENQUEUE_BATCH_BYTES} bytes of serialized payload and \
+                 metadata"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(sqlx::FromRow)]
@@ -877,8 +937,8 @@ macro_rules! finish_rows_sql {
             r#",
             deleted AS (
                 DELETE FROM ironqueue.jobs
-                WHERE id IN (SELECT id FROM candidate WHERE result_ttl_ms = 0)
-                RETURNING id
+                WHERE id IN (SELECT id FROM candidate WHERE ttl_ms = 0)
+                RETURNING id, awaited
             ),
             updated AS (
                 UPDATE ironqueue.jobs j
@@ -886,11 +946,11 @@ macro_rules! finish_rows_sql {
             $set,
             r#"
                 FROM candidate c
-                WHERE j.id = c.id AND c.result_ttl_ms IS DISTINCT FROM 0
-                RETURNING j.id
+                WHERE j.id = c.id AND c.ttl_ms IS DISTINCT FROM 0
+                RETURNING j.id, j.awaited
             ),
             finished AS (
-                SELECT id FROM deleted UNION ALL SELECT id FROM updated
+                SELECT id, awaited FROM deleted UNION ALL SELECT id, awaited FROM updated
             )
             "#,
             $tail
@@ -902,29 +962,33 @@ macro_rules! finish_rows_sql {
 /// `const` because [`finish_rows_sql!`] builds its statement with `concat!`, which
 /// takes literals. `result` is cleared unconditionally for the reason
 /// [`Database::abort`] clears it: half of the sweeper's marker pair must never
-/// survive on a row a caller could complete.
+/// survive on a row a caller could complete. `c.ttl_ms` is the candidate's
+/// retention for the outcome it is being finished with — `failed_ttl_ms`, here.
 macro_rules! abort_set_sql {
     () => {
         r#"status = 'aborted', result = NULL,
                     completed_at = now(), touched_at = now(),
-                    expires_at = CASE WHEN j.result_ttl_ms IS NULL THEN NULL
-                                      ELSE now() + (j.result_ttl_ms * interval '1 millisecond') END"#
+                    expires_at = CASE WHEN c.ttl_ms IS NULL THEN NULL
+                                      ELSE now() + (c.ttl_ms * interval '1 millisecond') END"#
     };
 }
 
 /// A [`finish_rows_sql!`] tail that returns every finished id and emits one
-/// completion notification per row, inside the statement's own transaction.
+/// completion notification per awaited row, inside the statement's own
+/// transaction. The lateral is a one-row scalar select, so every finished id
+/// comes back, awaited or not.
 macro_rules! notify_each_finished_sql {
     ($channel:literal, $status:literal) => {
         concat!(
             r#"SELECT finished.id
             FROM finished
-            CROSS JOIN LATERAL
-                pg_notify("#,
+            CROSS JOIN LATERAL (
+                SELECT CASE WHEN finished.awaited THEN pg_notify("#,
             $channel,
             r#", '{"id":"' || finished.id || '","status":""#,
             $status,
-            r#""}') AS notified"#
+            r#""}') END
+            ) AS notified"#
         )
     };
 }
@@ -952,6 +1016,12 @@ impl Database {
         // misses one heartbeat has its still-running attempts reclaimed at once.
         validate_nonzero_duration("sweep grace", options.sweep_grace)?;
         validate_nonzero_duration("migration lock timeout", options.migration_lock_timeout)?;
+        // Zero means "no throttle" rather than "a zero-length window", which
+        // would be the same thing spelled as a special case of the CAS below.
+        let notify_throttle = options.notify_throttle.filter(|window| !window.is_zero());
+        if let Some(window) = notify_throttle {
+            validate_duration("notify throttle", window)?;
+        }
         if !matches!(
             duration_to_ms_checked(options.migration_lock_timeout),
             Some(milliseconds) if milliseconds <= i64::from(i32::MAX)
@@ -1039,7 +1109,53 @@ impl Database {
             sweep_batch_size: i64::from(options.sweep_batch_size),
             counters: std::sync::Arc::new(QueueCounters::default()),
             notify_listener: std::sync::OnceLock::new(),
+            notify_throttle,
+            last_notify_ms: AtomicU64::new(NEVER_NOTIFIED),
+            notify_clock: Instant::now(),
         })
+    }
+
+    /// Whether an insert may carry its wakeup, given whether the client clock
+    /// reads any of its rows as due now.
+    ///
+    /// Without a throttle the statement decides on the server clock — a row
+    /// that comes due while this enqueue waits for a connection, or that is
+    /// due on a server whose clock runs ahead, still wakes workers. Under a
+    /// throttle the client's reading gates the slot instead, so a plainly
+    /// delayed row spends no window; a row due within a clock skew of now may
+    /// then wake nobody, which a throttled handle has already accepted as
+    /// poll-interval latency.
+    fn authorize_wakeup(&self, due_by_client_clock: bool) -> bool {
+        match self.notify_throttle {
+            None => true,
+            Some(window) => due_by_client_clock && self.take_throttle_slot(window),
+        }
+    }
+
+    /// Takes the throttle window's one slot when it is free, so concurrent
+    /// enqueues agree on a single winner per window.
+    ///
+    /// The slot is taken before the statement runs, so an enqueue that then
+    /// fails, or deduplicates, has spent it: the next enqueue inside the
+    /// window is carried by the workers' poll interval instead. That is the
+    /// documented cost of the throttle, and cheaper than the alternative of
+    /// releasing a slot after the fact, which would need every path out of the
+    /// statement to remember to.
+    fn take_throttle_slot(&self, window: Duration) -> bool {
+        // `validate_duration` bounded the window, so the conversion is exact
+        // and non-negative.
+        let window_ms = duration_to_ms(window).unsigned_abs();
+        let now_ms = u64::try_from(self.notify_clock.elapsed().as_millis()).unwrap_or(NEVER_NOTIFIED - 1);
+        let mut last = self.last_notify_ms.load(Ordering::Relaxed);
+        loop {
+            if last != NEVER_NOTIFIED && now_ms.saturating_sub(last) < window_ms {
+                return false;
+            }
+            match self.last_notify_ms.compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(current) => last = current,
+            }
+        }
     }
 
     pub(crate) fn name(&self) -> &str {
@@ -1121,10 +1237,13 @@ impl Database {
         Err(Error::Config(format!("job {} belongs to queue {:?}, not {:?}", job.id, job.queue, self.name)))
     }
 
+    /// Inserts one job. `awaited` marks the row for its completion
+    /// notification at insert time, for the enqueue that will wait on it.
     pub(crate) async fn enqueue_raw_delayed_result(
         &self,
         job: JobRequest,
         delay: Option<Duration>,
+        awaited: bool,
     ) -> Result<DatabaseEnqueueResult, Error> {
         // Before a connection is taken, on both branches. Behind `pool.begin()`
         // the dedupe path answered identical invalid input with whatever the
@@ -1140,12 +1259,11 @@ impl Database {
             // occurrence and every idempotent enqueue.
             let mut connection = PoolConnectionGuard::new(self.pool.acquire().await?);
             let mut transaction = connection.begin_transaction().await?;
-            let result = self.enqueue_validated_in(&mut transaction, job, delay).await?;
+            let result = self.enqueue_validated_in(&mut transaction, job, delay, awaited).await?;
             transaction.commit().await?;
             return Ok(result);
         }
 
-        let backoff = serde_json::to_value(job.config.backoff)?;
         // Autocommit, not an explicit transaction: one statement needs no
         // `BEGIN`/`COMMIT` to make `Enqueued(id)` the durability claim it reads
         // as. The wire fact that `RETURNING` puts the `DataRow` on the socket
@@ -1166,17 +1284,7 @@ impl Database {
         // duplicate, so the two extra round trips bought nothing on the hottest
         // path in the crate. The dedupe branch above keeps its transaction for a
         // different reason: its advisory lock is transaction-scoped.
-        let id = self
-            .insert_job(
-                &job,
-                &backoff,
-                job.config.timeout.map(duration_to_ms),
-                duration_to_ms(job.config.retry_delay),
-                job.config.retention.as_result_ttl_ms(),
-                delay.map(duration_to_ms),
-                &self.pool,
-            )
-            .await?;
+        let id = self.insert_job(&job, delay, awaited, &self.pool).await?;
         // `insert_job`'s only conflict target is the partial dedupe-key index,
         // whose predicate excludes keyless rows, so this insert always returns.
         match id {
@@ -1190,9 +1298,10 @@ impl Database {
         transaction: &mut sqlx::PgTransaction<'_>,
         job: JobRequest,
         delay: Option<Duration>,
+        awaited: bool,
     ) -> Result<DatabaseEnqueueResult, Error> {
         validate_enqueue(&job, delay)?;
-        self.enqueue_validated_in(transaction, job, delay).await
+        self.enqueue_validated_in(transaction, job, delay, awaited).await
     }
 
     /// [`Database::enqueue_raw_delayed_in_result`] for a request the caller has
@@ -1202,13 +1311,8 @@ impl Database {
         transaction: &mut sqlx::PgTransaction<'_>,
         job: JobRequest,
         delay: Option<Duration>,
+        awaited: bool,
     ) -> Result<DatabaseEnqueueResult, Error> {
-        let backoff = serde_json::to_value(job.config.backoff)?;
-        let timeout_ms = job.config.timeout.map(duration_to_ms);
-        let retry_delay_ms = duration_to_ms(job.config.retry_delay);
-        let result_ttl_ms = job.config.retention.as_result_ttl_ms();
-        let delay_ms = delay.map(duration_to_ms);
-
         if let Some(dedupe_key) = job.dedupe_key.as_deref() {
             sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext(length($2)::text || ':' || $2 || $3))")
                 .bind(self.dedupe_enqueue_lock_key)
@@ -1225,9 +1329,7 @@ impl Database {
             }
         }
 
-        let id = self
-            .insert_job(&job, &backoff, timeout_ms, retry_delay_ms, result_ttl_ms, delay_ms, &mut **transaction)
-            .await?;
+        let id = self.insert_job(&job, delay, awaited, &mut **transaction).await?;
         match (id, job.dedupe_key.as_deref()) {
             (Some(id), _) => Ok(DatabaseEnqueueResult::Inserted(id)),
             // The insert's only conflict target is the partial dedupe-key index,
@@ -1260,6 +1362,188 @@ impl Database {
         }
     }
 
+    /// [`Database::enqueue_raw_delayed_result`] for a batch, in one statement.
+    /// Results come back in input order.
+    ///
+    /// A keyless batch runs as one autocommit statement, for the durability
+    /// reasoning the single keyless enqueue gives; a batch carrying dedupe keys
+    /// runs in a transaction, which its advisory locks need.
+    pub(crate) async fn enqueue_batch_result(
+        &self,
+        batch: Vec<(JobRequest, Option<Duration>)>,
+    ) -> Result<Vec<DatabaseEnqueueResult>, Error> {
+        validate_batch(&batch)?;
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+        if batch.iter().any(|(job, _)| job.dedupe_key.is_some()) {
+            let mut connection = PoolConnectionGuard::new(self.pool.acquire().await?);
+            let mut transaction = connection.begin_transaction().await?;
+            let results = self.enqueue_batch_validated_in(&mut transaction, batch).await?;
+            transaction.commit().await?;
+            return Ok(results);
+        }
+        let ids = batch.iter().map(|_| Uuid::now_v7()).collect::<Vec<_>>();
+        let rows = batch.iter().zip(&ids).map(|((job, delay), id)| (*id, job, *delay)).collect::<Vec<_>>();
+        let inserted = self.insert_jobs(&rows, &self.pool).await?;
+        // A keyless row has no conflict target, and a primary-key collision
+        // raises rather than skipping, so every row landed; this guards the
+        // statement's shape, not a case the database can produce.
+        if inserted.len() != ids.len() {
+            return Err(Error::Config(format!(
+                "batch insert returned {} of {} keyless rows",
+                inserted.len(),
+                ids.len()
+            )));
+        }
+        Ok(ids.into_iter().map(DatabaseEnqueueResult::Inserted).collect())
+    }
+
+    pub(crate) async fn enqueue_batch_in_result(
+        &self,
+        transaction: &mut sqlx::PgTransaction<'_>,
+        batch: Vec<(JobRequest, Option<Duration>)>,
+    ) -> Result<Vec<DatabaseEnqueueResult>, Error> {
+        validate_batch(&batch)?;
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.enqueue_batch_validated_in(transaction, batch).await
+    }
+
+    /// The batch insert under its dedupe locks. Every distinct key is locked
+    /// first, and the live holders are read under those locks: a job whose
+    /// key is held — by a live row, or by an earlier job of this batch — is
+    /// reported as deduplicated against that holder and left out of the
+    /// insert. A holder of a different job name refuses the whole batch before
+    /// anything is written, where the single enqueue could only refuse it
+    /// after the fact.
+    ///
+    /// The locks are the ones a single keyed enqueue takes, so a batch and a
+    /// single enqueue of the same key serialize their decisions rather than
+    /// racing to `ON CONFLICT`, and they are taken in the order of their lock
+    /// ids rather than of the keys: `hashtext` is 32 bits wide, so two
+    /// distinct keys can share a lock, and two batches sorting such keys by
+    /// text could take the same two locks in opposite orders.
+    async fn enqueue_batch_validated_in(
+        &self,
+        transaction: &mut sqlx::PgTransaction<'_>,
+        batch: Vec<(JobRequest, Option<Duration>)>,
+    ) -> Result<Vec<DatabaseEnqueueResult>, Error> {
+        let mut keys = batch.iter().filter_map(|(job, _)| job.dedupe_key.as_deref()).collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys.dedup();
+        // Who holds each key: a live row read under the locks, or the first job
+        // of this batch to claim it.
+        let mut holders: HashMap<String, BatchKeyHolder> = HashMap::new();
+        if !keys.is_empty() {
+            // The subquery is not flattened — `DISTINCT` and `ORDER BY` keep
+            // it a subquery scan — so the outer projection, and with it the
+            // lock call, runs once per row in the order the sort produced.
+            sqlx::query(
+                "SELECT pg_advisory_xact_lock($1, locks.lock_id)
+                 FROM (
+                     SELECT DISTINCT hashtext(length($2)::text || ':' || $2 || key) AS lock_id
+                     FROM unnest($3::text[]) AS keys(key)
+                     ORDER BY lock_id
+                 ) AS locks",
+            )
+            .bind(self.dedupe_enqueue_lock_key)
+            .bind(&self.name)
+            .bind(&keys)
+            .execute(&mut **transaction)
+            .await?;
+            for keyed in self.live_dedupe_holders(&keys, transaction).await? {
+                holders.insert(keyed.dedupe_key, BatchKeyHolder::from(keyed.holder));
+            }
+        }
+
+        let ids = batch.iter().map(|_| Uuid::now_v7()).collect::<Vec<_>>();
+        let mut results = Vec::with_capacity(batch.len());
+        let mut rows = Vec::with_capacity(batch.len());
+        for ((job, delay), id) in batch.iter().zip(&ids) {
+            let Some(key) = job.dedupe_key.as_deref() else {
+                rows.push((*id, job, *delay));
+                results.push(DatabaseEnqueueResult::Inserted(*id));
+                continue;
+            };
+            match holders.get(key) {
+                Some(holder) if holder.name != job.name => {
+                    return Err(Error::Config(format!(
+                        "dedupe key {key:?} belongs to job {:?}, not {:?}",
+                        holder.name, job.name
+                    )));
+                }
+                Some(holder) => results.push(holder.deduplicated()),
+                None => {
+                    let holder =
+                        BatchKeyHolder { id: *id, name: job.name.clone(), retentions: job.config.retentions() };
+                    holders.insert(key.to_string(), holder);
+                    rows.push((*id, job, *delay));
+                    results.push(DatabaseEnqueueResult::Inserted(*id));
+                }
+            }
+        }
+
+        let inserted = self.insert_jobs(&rows, &mut **transaction).await?.into_iter().collect::<HashSet<_>>();
+        if inserted.len() == rows.len() {
+            return Ok(results);
+        }
+        // A keyed row `DO NOTHING` swallowed: a writer that did not take the
+        // enqueue lock committed its key in between, exactly as the single
+        // enqueue's second read handles. Re-read the holder and report the
+        // collision as the ordinary dedupe it is — to *every* job of the batch
+        // that carries the key, not only the one whose row was dropped: the
+        // later ones were reported as deduplicated against that row's id, and
+        // a handle to a row that never landed would fail every wait and fetch
+        // as a missing job.
+        let mut replacements: HashMap<String, BatchKeyHolder> = HashMap::new();
+        for (id, job, _) in &rows {
+            if inserted.contains(id) {
+                continue;
+            }
+            let Some(dedupe_key) = job.dedupe_key.as_deref() else {
+                return Err(Error::Config(format!("batch insert dropped keyless job {id}")));
+            };
+            let Some(holder) = self.live_dedupe_holder(dedupe_key, transaction).await? else {
+                return Err(Error::DedupeRace(format!(
+                    "dedupe key {dedupe_key:?} was taken by a writer that did not take the \
+                     enqueue lock, and released again before it could be reported; retry the \
+                     enqueue"
+                )));
+            };
+            // The winner is a foreign writer's row, so its name is nobody's
+            // guarantee. Refused here, while the transaction can still roll
+            // the batch's other rows back, rather than by the typed layer
+            // after `enqueue_batch_result` has committed them.
+            if holder.name != job.name {
+                return Err(Error::Config(format!(
+                    "dedupe key {dedupe_key:?} belongs to job {:?}, not {:?}",
+                    holder.name, job.name
+                )));
+            }
+            replacements.insert(dedupe_key.to_string(), BatchKeyHolder::from(holder));
+        }
+        for (result, (job, _)) in results.iter_mut().zip(&batch) {
+            if let Some(holder) = job.dedupe_key.as_deref().and_then(|key| replacements.get(key)) {
+                *result = holder.deduplicated();
+            }
+        }
+        Ok(results)
+    }
+
+    /// Marks a job as awaited, so its finish emits the completion notification.
+    /// A no-op for a row already marked or already gone; a wait on a missing
+    /// job learns that from its first poll, not from here.
+    pub(crate) async fn mark_awaited(&self, id: Uuid) -> Result<(), Error> {
+        sqlx::query("UPDATE ironqueue.jobs SET awaited = true WHERE id = $1 AND queue = $2 AND NOT awaited")
+            .bind(id)
+            .bind(&self.name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// The live job holding `dedupe_key` in this queue, if one does.
     ///
     /// The status set is `jobs_dedupe_key_idx`'s own predicate, so this is an
@@ -1271,7 +1555,7 @@ impl Database {
     ) -> Result<Option<DatabaseDedupeHolder>, Error> {
         Ok(sqlx::query_as::<_, DatabaseDedupeHolder>(
             r#"
-            SELECT id, name, result_ttl_ms, scheduled_at, kind FROM ironqueue.jobs
+            SELECT id, name, result_ttl_ms, failed_ttl_ms, scheduled_at, kind FROM ironqueue.jobs
             WHERE queue = $1 AND dedupe_key = $2
               AND status IN ('queued', 'running', 'aborting')
             "#,
@@ -1279,6 +1563,27 @@ impl Database {
         .bind(&self.name)
         .bind(dedupe_key)
         .fetch_optional(executor)
+        .await?)
+    }
+
+    /// [`Database::live_dedupe_holder`] for every key of a batch in one read.
+    /// The same live-status set, for the reason that method's row type gives.
+    async fn live_dedupe_holders(
+        &self,
+        dedupe_keys: &[&str],
+        executor: &mut PgConnection,
+    ) -> Result<Vec<DatabaseKeyedDedupeHolder>, Error> {
+        Ok(sqlx::query_as::<_, DatabaseKeyedDedupeHolder>(
+            r#"
+            SELECT dedupe_key, id, name, result_ttl_ms, failed_ttl_ms, scheduled_at, kind
+            FROM ironqueue.jobs
+            WHERE queue = $1 AND dedupe_key = ANY($2)
+              AND status IN ('queued', 'running', 'aborting')
+            "#,
+        )
+        .bind(&self.name)
+        .bind(dedupe_keys)
+        .fetch_all(executor)
         .await?)
     }
 
@@ -1576,10 +1881,11 @@ impl Database {
                     INSERT INTO ironqueue.jobs (
                         queue, name, payload, dedupe_key, priority,
                         max_attempts, timeout_ms, retry_delay_ms,
-                        backoff, result_ttl_ms, scheduled_at, enqueued_at, meta, kind, cron_expr
+                        backoff, result_ttl_ms, failed_ttl_ms, scheduled_at, enqueued_at, meta, kind,
+                        cron_expr
                     )
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
-                            $9, $10, $11, clock_timestamp(), $12, 'cron', $13)
+                            $9, $10, $15, $11, clock_timestamp(), $12, 'cron', $13)
                     ON CONFLICT (queue, dedupe_key) WHERE dedupe_key IS NOT NULL
                         AND status IN ('queued', 'running', 'aborting') DO NOTHING
                     RETURNING id
@@ -1602,6 +1908,7 @@ impl Database {
             .bind(&job.meta)
             .bind(&entry.expr)
             .bind(&self.notify_channel)
+            .bind(job.config.failed_retention.as_result_ttl_ms())
             .fetch_optional(&mut *tx)
             .await?;
             // The only conflict target is the partial dedupe-key index over
@@ -1700,37 +2007,46 @@ impl Database {
     /// durability `EnqueueResult::Enqueued` claims; the dedupe caller passes its
     /// own transaction, which it needs for the advisory lock rather than for
     /// this insert.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// The wakeup is skipped for a row that is not due yet, and under the
+    /// handle's notify throttle. Workers poll on their own interval for
+    /// scheduled work, so a notification for a delayed row could only wake
+    /// every worker on the queue to claim nothing — while still paying what
+    /// every `NOTIFY` costs: PostgreSQL serializes notifying commits
+    /// cluster-wide behind one lock (`PreCommit_Notify`), held through the
+    /// commit's WAL flush, so under durable commits notifying transactions
+    /// cannot overlap at all.
     async fn insert_job<'e>(
         &self,
         job: &JobRequest,
-        backoff: &Value,
-        timeout_ms: Option<i64>,
-        retry_delay_ms: i64,
-        result_ttl_ms: Option<i64>,
-        delay_ms: Option<i64>,
+        delay: Option<Duration>,
+        awaited: bool,
         executor: impl sqlx::PgExecutor<'e>,
     ) -> Result<Option<Uuid>, Error> {
+        let backoff = serde_json::to_value(job.config.backoff)?;
+        let notify = self.authorize_wakeup(is_due_now(job, delay));
         let row = sqlx::query_scalar::<_, Uuid>(
             r#"
             WITH inserted AS (
                 INSERT INTO ironqueue.jobs (
                     queue, name, payload, dedupe_key, priority, max_attempts,
-                    timeout_ms, retry_delay_ms, backoff, result_ttl_ms,
-                    scheduled_at, enqueued_at, meta, kind, cron_expr
+                    timeout_ms, retry_delay_ms, backoff, result_ttl_ms, failed_ttl_ms,
+                    scheduled_at, enqueued_at, meta, kind, cron_expr, awaited
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $15,
                         COALESCE(
                             $11,
                             statement_timestamp() + ($13::bigint * interval '1 millisecond'),
                             statement_timestamp()
                         ),
-                        statement_timestamp(), $12, 'job', NULL)
+                        statement_timestamp(), $12, 'job', NULL, $16)
                 ON CONFLICT (queue, dedupe_key) WHERE dedupe_key IS NOT NULL
                     AND status IN ('queued', 'running', 'aborting') DO NOTHING
-                RETURNING id
+                RETURNING id, scheduled_at
             )
-            SELECT id, pg_notify($14, 'enqueue') IS NULL AS notified
+            SELECT id,
+                   (CASE WHEN $17::boolean AND scheduled_at <= statement_timestamp()
+                         THEN pg_notify($14, 'enqueue') END) IS NULL AS notified
             FROM inserted
             "#,
         )
@@ -1740,17 +2056,129 @@ impl Database {
         .bind(&job.dedupe_key)
         .bind(job.config.priority)
         .bind(job.config.max_attempts as i32)
-        .bind(timeout_ms)
-        .bind(retry_delay_ms)
-        .bind(backoff)
-        .bind(result_ttl_ms)
+        .bind(job.config.timeout.map(duration_to_ms))
+        .bind(duration_to_ms(job.config.retry_delay))
+        .bind(&backoff)
+        .bind(job.config.retention.as_result_ttl_ms())
         .bind(job.scheduled_at.map(|timestamp| timestamp.to_sqlx()))
         .bind(&job.meta)
-        .bind(delay_ms)
+        .bind(delay.map(duration_to_ms))
         .bind(&self.notify_channel)
+        .bind(job.config.failed_retention.as_result_ttl_ms())
+        .bind(awaited)
+        .bind(notify)
         .fetch_optional(executor)
         .await?;
         Ok(row)
+    }
+
+    /// [`Database::insert_job`] for a batch: one statement over unnested
+    /// arrays, with client-generated ids so the caller can tell which rows
+    /// landed, and at most one wakeup for the whole batch — emitted when any
+    /// inserted row is due, and evaluated once because the lateral aggregate
+    /// is uncorrelated. Returns the ids that were inserted; a keyed row `DO
+    /// NOTHING` swallowed is absent.
+    async fn insert_jobs<'e>(
+        &self,
+        rows: &[(Uuid, &JobRequest, Option<Duration>)],
+        executor: impl sqlx::PgExecutor<'e>,
+    ) -> Result<Vec<Uuid>, Error> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut backoffs = Vec::with_capacity(rows.len());
+        for (_, job, _) in rows {
+            backoffs.push(serde_json::to_value(job.config.backoff)?);
+        }
+        let notify = self.authorize_wakeup(rows.iter().any(|(_, job, delay)| is_due_now(job, *delay)));
+        let inserted = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            WITH input AS (
+                SELECT *
+                FROM unnest($3::uuid[], $4::text[], $5::jsonb[], $6::text[], $7::smallint[], $8::integer[],
+                            $9::bigint[], $10::bigint[], $11::jsonb[], $12::bigint[], $13::bigint[],
+                            $14::timestamptz[], $15::bigint[], $16::jsonb[])
+                    AS t(id, name, payload, dedupe_key, priority, max_attempts,
+                         timeout_ms, retry_delay_ms, backoff, result_ttl_ms, failed_ttl_ms,
+                         scheduled_at, delay_ms, meta)
+            ),
+            inserted AS (
+                INSERT INTO ironqueue.jobs (
+                    id, queue, name, payload, dedupe_key, priority, max_attempts,
+                    timeout_ms, retry_delay_ms, backoff, result_ttl_ms, failed_ttl_ms,
+                    scheduled_at, enqueued_at, meta, kind, cron_expr, awaited
+                )
+                SELECT id, $1, name, payload, dedupe_key, priority, max_attempts,
+                       timeout_ms, retry_delay_ms, backoff, result_ttl_ms, failed_ttl_ms,
+                       COALESCE(
+                           scheduled_at,
+                           statement_timestamp() + (delay_ms * interval '1 millisecond'),
+                           statement_timestamp()
+                       ),
+                       statement_timestamp(), meta, 'job', NULL, false
+                FROM input
+                ON CONFLICT (queue, dedupe_key) WHERE dedupe_key IS NOT NULL
+                    AND status IN ('queued', 'running', 'aborting') DO NOTHING
+                RETURNING id, scheduled_at
+            )
+            SELECT inserted.id
+            FROM inserted
+            CROSS JOIN LATERAL (
+                SELECT CASE WHEN $17::boolean AND bool_or(due.scheduled_at <= statement_timestamp())
+                            THEN pg_notify($2, 'enqueue') END
+                FROM inserted due
+            ) AS notified
+            "#,
+        )
+        .bind(&self.name)
+        .bind(&self.notify_channel)
+        .bind(rows.iter().map(|(id, _, _)| *id).collect::<Vec<_>>())
+        .bind(rows.iter().map(|(_, job, _)| job.name.clone()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|(_, job, _)| job.payload.clone()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|(_, job, _)| job.dedupe_key.clone()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|(_, job, _)| job.config.priority).collect::<Vec<_>>())
+        .bind(rows.iter().map(|(_, job, _)| job.config.max_attempts as i32).collect::<Vec<_>>())
+        .bind(rows.iter().map(|(_, job, _)| job.config.timeout.map(duration_to_ms)).collect::<Vec<_>>())
+        .bind(rows.iter().map(|(_, job, _)| duration_to_ms(job.config.retry_delay)).collect::<Vec<_>>())
+        .bind(backoffs)
+        .bind(rows.iter().map(|(_, job, _)| job.config.retention.as_result_ttl_ms()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|(_, job, _)| job.config.failed_retention.as_result_ttl_ms()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|(_, job, _)| job.scheduled_at.map(|at| at.to_sqlx())).collect::<Vec<_>>())
+        .bind(rows.iter().map(|(_, _, delay)| delay.map(duration_to_ms)).collect::<Vec<_>>())
+        .bind(rows.iter().map(|(_, job, _)| job.meta.clone()).collect::<Vec<_>>())
+        .bind(notify)
+        .fetch_all(executor)
+        .await?;
+        Ok(inserted)
+    }
+}
+
+/// Whether a request will be due the moment it is inserted, as far as the
+/// client clock can tell. Only a throttled handle's slot accounting reads
+/// this; the statement decides on the server clock whether to notify.
+fn is_due_now(job: &JobRequest, delay: Option<Duration>) -> bool {
+    delay.is_none_or(|delay| delay.is_zero()) && job.scheduled_at.is_none_or(|at| at <= Timestamp::now())
+}
+
+/// The holder of one dedupe key as a batch records it: a live row read under
+/// the batch's locks, or the first job of the batch to claim the key. Every
+/// later job of the batch carrying that key is reported as deduplicated
+/// against it.
+struct BatchKeyHolder {
+    id: Uuid,
+    name: String,
+    retentions: JobRetentions,
+}
+
+impl BatchKeyHolder {
+    fn deduplicated(&self) -> DatabaseEnqueueResult {
+        DatabaseEnqueueResult::Deduplicated { id: self.id, name: self.name.clone(), retentions: self.retentions }
+    }
+}
+
+impl From<DatabaseDedupeHolder> for BatchKeyHolder {
+    fn from(holder: DatabaseDedupeHolder) -> Self {
+        Self { id: holder.id, retentions: holder.retentions(), name: holder.name }
     }
 }
 
@@ -1769,7 +2197,7 @@ impl Database {
             SELECT id, dedupe_key, queue, name, payload,
                    status, priority, attempts,
                    max_attempts, timeout_ms, retry_delay_ms,
-                   backoff, result_ttl_ms, scheduled_at,
+                   backoff, result_ttl_ms, failed_ttl_ms, scheduled_at,
                    enqueued_at, started_at, touched_at, completed_at, expires_at,
                    result, error, meta, worker_id, kind, cron_expr, retried_at
             FROM ironqueue.jobs
@@ -1822,12 +2250,53 @@ impl Database {
                 (SELECT COUNT(*) FROM ironqueue.jobs
                   WHERE queue = $1 AND status = 'failed') AS failed,
                 (SELECT COUNT(*) FROM ironqueue.jobs
-                  WHERE queue = $1 AND status = 'aborted') AS aborted
+                  WHERE queue = $1 AND status = 'aborted') AS aborted,
+                (SELECT scheduled_at FROM ironqueue.jobs
+                  WHERE queue = $1 AND status = 'queued' AND scheduled_at <= now()
+                  ORDER BY scheduled_at, id
+                  LIMIT 1) AS oldest_ready_at
             "#,
         )
         .bind(&self.name)
         .fetch_one(&self.pool)
         .await?)
+    }
+
+    /// Deletes up to `limit` queued jobs of this queue, oldest due first, and
+    /// returns how many went. `name` narrows the purge to one job name.
+    ///
+    /// Rows another transaction holds locked — a claim in flight — are
+    /// skipped rather than waited for, and the delete re-checks `queued` so a
+    /// row claimed between the two steps is left to its worker.
+    pub(crate) async fn purge_queued_jobs(&self, name: Option<&str>, limit: u32) -> Result<u64, Error> {
+        if limit == 0 {
+            return Err(Error::Config("purge limit must be at least one job".into()));
+        }
+        let deleted = sqlx::query_scalar::<_, i64>(
+            r#"
+            WITH doomed AS (
+                SELECT id FROM ironqueue.jobs
+                WHERE queue = $1 AND status = 'queued'
+                  AND ($2::text IS NULL OR name = $2)
+                ORDER BY scheduled_at, id
+                LIMIT $3
+                FOR UPDATE SKIP LOCKED
+            ),
+            deleted AS (
+                DELETE FROM ironqueue.jobs j
+                USING doomed
+                WHERE j.id = doomed.id AND j.status = 'queued'
+                RETURNING j.id
+            )
+            SELECT count(*) FROM deleted
+            "#,
+        )
+        .bind(&self.name)
+        .bind(name)
+        .bind(i64::from(limit))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(u64::try_from(deleted).unwrap_or_default())
     }
 
     pub(crate) async fn workers_page(&self, limit: i64, after: Option<WorkerCursor>) -> Result<Vec<WorkerInfo>, Error> {
@@ -2062,7 +2531,7 @@ impl Database {
             SELECT id, dedupe_key, queue, name, payload,
                    status, priority, attempts,
                    max_attempts, timeout_ms, retry_delay_ms,
-                   backoff, result_ttl_ms, scheduled_at,
+                   backoff, result_ttl_ms, failed_ttl_ms, scheduled_at,
                    enqueued_at, started_at, touched_at, completed_at, expires_at,
                    result, error, meta, worker_id, kind, cron_expr, retried_at
             FROM ironqueue.jobs WHERE id = $1 AND queue = $2
@@ -2107,15 +2576,15 @@ impl Database {
                     -- clearing it here costs nothing.
                     result = NULL,
                     completed_at = CASE WHEN status = 'queued' THEN now() ELSE completed_at END,
-                    expires_at = CASE WHEN status = 'queued' AND result_ttl_ms IS NOT NULL
-                        THEN now() + (result_ttl_ms * interval '1 millisecond') ELSE expires_at END
+                    expires_at = CASE WHEN status = 'queued' AND failed_ttl_ms IS NOT NULL
+                        THEN now() + (failed_ttl_ms * interval '1 millisecond') ELSE expires_at END
                 WHERE id = $1 AND queue = $3
                   AND (status IN ('queued', 'running')
                        OR (status = 'aborting' AND error = $6 AND result = $7))
-                RETURNING status
+                RETURNING status, awaited
             )
             SELECT status,
-                   (CASE WHEN status = 'aborted' THEN pg_notify($4, $5) END) IS NULL
+                   (CASE WHEN status = 'aborted' AND awaited THEN pg_notify($4, $5) END) IS NULL
                        AS notify_skipped
             FROM updated
             "#,
@@ -2168,7 +2637,7 @@ impl Database {
                           CASE WHEN kind = 'cron' THEN NULL
                                ELSE dedupe_key END AS dedupe_key,
                           priority, attempts, timeout_ms, retry_delay_ms, backoff,
-                          result_ttl_ms, meta, kind, cron_expr
+                          result_ttl_ms, failed_ttl_ms, meta, kind, cron_expr
             ), locked AS MATERIALIZED (
                 SELECT pg_advisory_xact_lock($4,
                     hashtext(length(queue)::text || ':' || queue || dedupe_key))
@@ -2180,11 +2649,12 @@ impl Database {
             INSERT INTO ironqueue.jobs (
                 queue, name, payload, dedupe_key, priority, attempts,
                 max_attempts, timeout_ms, retry_delay_ms, backoff,
-                result_ttl_ms, scheduled_at, enqueued_at, meta, error, kind, cron_expr
+                result_ttl_ms, failed_ttl_ms, scheduled_at, enqueued_at, meta, error, kind, cron_expr
             )
             SELECT queue, name, payload, dedupe_key, priority, attempts,
                    attempts + 1, timeout_ms, retry_delay_ms, backoff,
-                   result_ttl_ms, wall_clock.current, wall_clock.current, meta, $2, kind, cron_expr
+                   result_ttl_ms, failed_ttl_ms, wall_clock.current, wall_clock.current, meta, $2, kind,
+                   cron_expr
             FROM source JOIN wall_clock ON true
             ON CONFLICT (queue, dedupe_key) WHERE dedupe_key IS NOT NULL
                 AND status IN ('queued', 'running', 'aborting') DO NOTHING
@@ -2412,16 +2882,21 @@ impl Database {
                           SELECT 1 FROM ironqueue.workers gone
                           WHERE gone.id = j.worker_id AND gone.queue = j.queue)
                        OR j.touched_at + ($8::bigint * interval '1 millisecond') <= now())
-                RETURNING j.id
+                RETURNING j.id, j.scheduled_at
             )
             -- The lateral keeps the wakeup inside this statement's transaction,
-            -- so it is emitted exactly when the requeue commits. Its arguments
-            -- are constant, so the planner evaluates the function scan once for
-            -- the whole batch rather than per row; one wakeup is enough, because
-            -- every idle fetcher re-polls on it.
+            -- so it is emitted exactly when the requeue commits, and only when
+            -- a requeued row is due now — a row retried with a delay wakes
+            -- nobody, as in `insert_job`. The aggregate is uncorrelated, so the
+            -- planner evaluates it once for the whole batch rather than per
+            -- row; one wakeup is enough, because every idle fetcher re-polls on
+            -- it, and a one-row aggregate keeps every requeued id in the join.
             SELECT requeued.id
             FROM requeued
-            CROSS JOIN LATERAL pg_notify($9, 'enqueue') AS notified
+            CROSS JOIN LATERAL (
+                SELECT CASE WHEN bool_or(due.scheduled_at <= now()) THEN pg_notify($9, 'enqueue') END
+                FROM requeued due
+            ) AS notified
             "#,
         )
         .bind(&ids)
@@ -2458,7 +2933,7 @@ impl Database {
                     AS t(id, attempts, worker_id)
             ),
             candidate AS (
-                SELECT j.id, j.result_ttl_ms
+                SELECT j.id, j.failed_ttl_ms AS ttl_ms
                 FROM ironqueue.jobs j
                 JOIN requested r ON r.id = j.id
                 WHERE j.queue = $4
@@ -2540,8 +3015,12 @@ impl Database {
         // immediate-delete retention are removed instead of updated, and the
         // done notification fires only when a row actually finished.
         let row = sqlx::query_as::<_, FinishResult>(finish_rows_sql!(
+            // The retention that applies is the outcome's: the result clock
+            // for `complete`, the failure clock for `failed` and `aborted`.
             r#"candidate AS (
-                SELECT j.id, j.result_ttl_ms FROM ironqueue.jobs j
+                SELECT j.id,
+                       CASE WHEN $2 = 'complete' THEN j.result_ttl_ms ELSE j.failed_ttl_ms END AS ttl_ms
+                FROM ironqueue.jobs j
                 WHERE j.id = $1 AND j.queue = $7
                   AND (j.status = 'running'
                        OR (j.status = 'aborting'
@@ -2552,13 +3031,15 @@ impl Database {
             r#"status = $2, result = $3,
                     error = CASE WHEN $2 = 'complete' THEN $4 ELSE COALESCE($4, j.error) END,
                     completed_at = now(), touched_at = now(),
-                    expires_at = CASE WHEN j.result_ttl_ms IS NULL THEN NULL
-                                      ELSE now() + (j.result_ttl_ms * interval '1 millisecond') END"#,
+                    expires_at = CASE WHEN c.ttl_ms IS NULL THEN NULL
+                                      ELSE now() + (c.ttl_ms * interval '1 millisecond') END"#,
             // The one caller that needs a *decision* rather than the ids, and the
             // one whose payload is bound rather than built per row: the status is
-            // the caller's, not a literal.
+            // the caller's, not a literal. The notification goes out only for a
+            // row somebody is waiting on.
             r#"SELECT EXISTS (SELECT 1 FROM finished) AS finished,
-                   (SELECT pg_notify($11, $12) FROM finished) IS NULL AS notify_skipped"#
+                   (SELECT pg_notify($11, $12) FROM finished WHERE finished.awaited) IS NULL
+                       AS notify_skipped"#
         ))
         .bind(attempt.id)
         .bind(status)
@@ -2763,7 +3244,7 @@ pub(crate) const DEQUEUE_CLAIM_SQL: &str = r#"
                   job.payload, job.status, job.priority,
                   job.attempts, job.max_attempts, job.timeout_ms,
                   job.retry_delay_ms, job.backoff,
-                  job.result_ttl_ms, job.scheduled_at, job.enqueued_at,
+                  job.result_ttl_ms, job.failed_ttl_ms, job.scheduled_at, job.enqueued_at,
                   job.started_at, job.touched_at, job.completed_at,
                   job.expires_at, job.result, job.error, job.meta,
                   job.worker_id, job.kind, job.cron_expr, job.retried_at
@@ -2771,7 +3252,7 @@ pub(crate) const DEQUEUE_CLAIM_SQL: &str = r#"
     SELECT id, dedupe_key, queue, name, payload,
            status, priority, attempts,
            max_attempts, timeout_ms, retry_delay_ms,
-           backoff, result_ttl_ms, scheduled_at,
+           backoff, result_ttl_ms, failed_ttl_ms, scheduled_at,
            enqueued_at, started_at, touched_at, completed_at, expires_at,
            result, error, meta, worker_id, kind, cron_expr, retried_at
     FROM updated
@@ -2815,7 +3296,7 @@ const REQUEUE_GUARDED_SQL: &str = r#"
                   -- check; the callers' abort fallbacks finish such a row.
                   AND (CASE WHEN $7 THEN j.attempts < 2147483646
                        ELSE j.attempts < j.max_attempts END)
-                RETURNING j.id
+                RETURNING j.id, j.scheduled_at
             ),
             intake_closed AS (
                 UPDATE ironqueue.workers w
@@ -2823,9 +3304,12 @@ const REQUEUE_GUARDED_SQL: &str = r#"
                 WHERE $13 AND w.id = $5 AND w.queue = $6
                 RETURNING w.id
             )
+            -- A retry scheduled for later wakes nobody: the fetch loop polls on
+            -- its own interval for scheduled work, and every `NOTIFY` is a
+            -- cluster-wide commit serialization point (see `insert_job`).
             SELECT EXISTS (SELECT 1 FROM requeued) AS requeued,
-                   (SELECT pg_notify($12, 'enqueue') FROM requeued) IS NULL
-                       AS notify_skipped,
+                   (SELECT pg_notify($12, 'enqueue') FROM requeued WHERE requeued.scheduled_at <= now())
+                       IS NULL AS notify_skipped,
                    EXISTS (SELECT 1 FROM intake_closed) AS intake_closed
             "#;
 
@@ -2870,7 +3354,7 @@ async fn abort_unsettled_claim(
 ) -> Result<bool, sqlx::Error> {
     let aborted = sqlx::query_scalar::<_, Uuid>(finish_rows_sql!(
         r#"candidate AS (
-            SELECT j.id, j.result_ttl_ms FROM ironqueue.jobs j
+            SELECT j.id, j.failed_ttl_ms AS ttl_ms FROM ironqueue.jobs j
             WHERE j.id = $1 AND j.queue = $2
               AND j.status IN ('running', 'aborting')
               AND j.attempts = $3 AND j.worker_id IS NOT DISTINCT FROM $4
@@ -2882,8 +3366,8 @@ async fn abort_unsettled_claim(
                 error = CASE WHEN j.status = 'running' OR (j.error = $5 AND j.result = $6)
                              THEN $7 ELSE j.error END,
                 completed_at = now(), touched_at = now(),
-                expires_at = CASE WHEN j.result_ttl_ms IS NULL THEN NULL
-                                  ELSE now() + (j.result_ttl_ms * interval '1 millisecond') END"#,
+                expires_at = CASE WHEN c.ttl_ms IS NULL THEN NULL
+                                  ELSE now() + (c.ttl_ms * interval '1 millisecond') END"#,
         notify_each_finished_sql!("$8", "aborted")
     ))
     .bind(claim.id)

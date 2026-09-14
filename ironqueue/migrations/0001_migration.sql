@@ -67,6 +67,13 @@ CREATE TABLE ironqueue.jobs (
     -- abort both compute.
     result_ttl_ms  bigint
         CHECK (result_ttl_ms IS NULL OR result_ttl_ms BETWEEN 0 AND 3153600000000),
+    -- Retention for a row that finishes `failed` or `aborted`, with `result_ttl_ms`'s encoding and bounds. It is a
+    -- separate clock because the two outcomes are read at different times: a result is collected within moments of
+    -- the finish by whoever waited for it, while a failure is investigated by an operator after the fact, often a
+    -- night later. One shared retention made the default that suits results (minutes) silently purge every failure
+    -- before anyone looked, and `retry_job` then had no row left to retry.
+    failed_ttl_ms  bigint
+        CHECK (failed_ttl_ms IS NULL OR failed_ttl_ms BETWEEN 0 AND 3153600000000),
     scheduled_at   timestamptz NOT NULL DEFAULT clock_timestamp(),
     enqueued_at    timestamptz NOT NULL DEFAULT clock_timestamp(),
     started_at     timestamptz,
@@ -80,6 +87,13 @@ CREATE TABLE ironqueue.jobs (
     kind           text NOT NULL DEFAULT 'job' CHECK (kind IN ('job', 'cron')),
     cron_expr      text,
     retried_at     timestamptz,
+    -- Whether a caller is waiting on this job's completion channel. A finish
+    -- emits its completion `NOTIFY` only for a row that carries this flag:
+    -- PostgreSQL serializes every notifying commit cluster-wide behind one lock
+    -- (`PreCommit_Notify`), so a notification nobody listens for costs every
+    -- other committing writer, not just this one. `enqueue_and_wait` sets it
+    -- with the insert; `JobHandle::wait` sets it before subscribing.
+    awaited        boolean NOT NULL DEFAULT false,
     -- Bounds for the attempt counters, closing the last numeric column a foreign SQL writer could poison a
     -- queue through (foreign writers exist by design — see the enqueue-lock fallback in `database.rs` — and
     -- the text, duration, and timestamp columns carry their bounds elsewhere in this table). The dequeue claim
@@ -407,3 +421,12 @@ AS $$
         LIMIT p_limit
     ) candidate
 $$;
+
+-- Read access for the built-in monitoring role, so an operator's metrics
+-- exporter can watch queue depth, worker leases and cron schedules without a
+-- custom grant per deployment. `pg_monitor` is the role PostgreSQL ships for
+-- exactly this, and it carries no write privilege here. The default-privileges
+-- grant covers tables a later migration creates under the same owner.
+GRANT USAGE ON SCHEMA ironqueue TO pg_monitor;
+GRANT SELECT ON ALL TABLES IN SCHEMA ironqueue TO pg_monitor;
+ALTER DEFAULT PRIVILEGES IN SCHEMA ironqueue GRANT SELECT ON TABLES TO pg_monitor;

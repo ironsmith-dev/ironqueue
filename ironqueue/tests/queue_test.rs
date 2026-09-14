@@ -12,8 +12,8 @@ use crate::{
     wait_until, with_config,
 };
 use ironqueue::{
-    EnqueueResult, Error, JobCursor, JobFilter, JobRetention, JobRetryBackoff, JobStatus, Queue, WorkerCursor,
-    WorkerFilter,
+    EnqueueResult, Error, JobConfig, JobCursor, JobFilter, JobRetention, JobRetryBackoff, JobStatus, Queue,
+    WorkerCursor, WorkerFilter,
 };
 use jiff::{SignedDuration, Timestamp};
 use serde_json::json;
@@ -1995,7 +1995,9 @@ async fn test_dropping_an_unsettled_consumer_attempt_recovers_the_job(pool: PgPo
         .queue
         .enqueue_raw(with_config("dropped-ephemeral", |config| {
             config.max_attempts = 1;
-            config.retention = JobRetention::DeleteImmediately;
+            // The recovery finishes the row `aborted`, so it is the failure
+            // retention that deletes it.
+            config.failed_retention = JobRetention::DeleteImmediately;
         }))
         .await
         .unwrap()
@@ -2320,9 +2322,11 @@ async fn test_abort_queued_job_finishes_immediately(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn test_abort_queued_delete_immediately_survives_until_sweep(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
+    // An abort is a failure outcome, so the failure retention is the one that
+    // applies.
     let id = db
         .queue
-        .enqueue_raw(with_config("j", |config| config.retention = JobRetention::DeleteImmediately))
+        .enqueue_raw(with_config("j", |config| config.failed_retention = JobRetention::DeleteImmediately))
         .await
         .unwrap()
         .unwrap();
@@ -4868,4 +4872,398 @@ async fn test_simultaneous_claims_never_return_a_row_twice(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(malformed, 0, "every claimed row must be running on exactly its first attempt");
+}
+
+/// A `LISTEN` on one of this queue's channels, on its own connection.
+async fn listen(pool: &PgPool, channel: &str) -> sqlx::postgres::PgListener {
+    let mut listener = sqlx::postgres::PgListener::connect_with(pool).await.expect("listener connection");
+    listener.listen(channel).await.expect("LISTEN");
+    listener
+}
+
+/// The next notification, or a panic naming what should have sent it.
+async fn expect_notification(listener: &mut sqlx::postgres::PgListener, what: &str) -> sqlx::postgres::PgNotification {
+    tokio::time::timeout(Duration::from_secs(5), listener.recv())
+        .await
+        .unwrap_or_else(|_| panic!("{what} did not notify"))
+        .expect("listener recv")
+}
+
+/// Asserts that nothing arrives for long enough to have arrived.
+async fn expect_silence(listener: &mut sqlx::postgres::PgListener, what: &str) {
+    assert!(tokio::time::timeout(Duration::from_millis(300), listener.recv()).await.is_err(), "{what} must not notify");
+}
+
+async fn mark_awaited(db: &TestDb, id: Uuid) {
+    sqlx::query("UPDATE ironqueue.jobs SET awaited = true WHERE id = $1")
+        .bind(id)
+        .execute(db.queue.pool())
+        .await
+        .expect("mark awaited");
+}
+
+/// Every `NOTIFY` is a cluster-wide serialization point — PostgreSQL commits
+/// notifying transactions one at a time — so an enqueue wakes workers only when
+/// the wakeup can do anything: for a row that is due now. Workers poll for
+/// scheduled work on their own interval, and waking every worker on the queue
+/// for a delayed row would only have them claim nothing.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_enqueue_wakes_workers_only_for_jobs_that_are_due(pool: PgPool) {
+    let db = TestDb::new(pool.clone()).await;
+    let channel = ironqueue::__test_support::notify_channel(db.queue.name());
+    let mut wakeups = listen(&pool, &channel).await;
+    let later = Timestamp::now() + SignedDuration::from_secs(3600);
+
+    // Both enqueue paths — keyless autocommit and the keyed transaction — stay
+    // silent for a delayed row.
+    db.queue.enqueue_raw(new_job("later", |job| job.scheduled_at = Some(later))).await.unwrap();
+    db.queue
+        .enqueue_raw(new_job("later-keyed", |job| {
+            job.scheduled_at = Some(later);
+            job.dedupe_key = Some("later".into());
+        }))
+        .await
+        .unwrap();
+    expect_silence(&mut wakeups, "a delayed enqueue").await;
+
+    // And both wake for a row that is due.
+    db.queue.enqueue_raw(new_job("now", |_| {})).await.unwrap();
+    let notification = expect_notification(&mut wakeups, "a due enqueue").await;
+    assert_eq!(notification.channel(), channel);
+    assert_eq!(notification.payload(), "enqueue");
+    db.queue.enqueue_raw(new_job("now-keyed", |job| job.dedupe_key = Some("now".into()))).await.unwrap();
+    expect_notification(&mut wakeups, "a due keyed enqueue").await;
+}
+
+/// Whether a row is due is the server's decision, made when the statement
+/// runs: a row scheduled a moment ahead that comes due while its enqueue waits
+/// for a pooled connection still wakes workers, rather than being written off
+/// by the client's clock before the statement was even sent.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_enqueue_wakes_workers_for_a_row_that_comes_due_while_it_waits_for_a_connection(pool: PgPool) {
+    let query_pool = crate::pool_with_max(&pool, 1).await;
+    let db = TestDb::new(query_pool.clone()).await;
+    let mut wakeups = listen(&pool, &ironqueue::__test_support::notify_channel(db.queue.name())).await;
+
+    let held = query_pool.acquire().await.unwrap();
+    let enqueue = tokio::spawn({
+        let queue = db.queue.clone();
+        async move {
+            queue
+                .enqueue_raw(new_job("soon", |job| {
+                    job.scheduled_at = Some(Timestamp::now() + SignedDuration::from_millis(200));
+                }))
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    drop(held);
+    enqueue.await.unwrap().unwrap();
+    expect_notification(&mut wakeups, "a row that came due while its enqueue waited for a connection").await;
+}
+
+/// The same rule for a retry: one scheduled for later wakes nobody.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_retry_wakes_workers_only_when_the_retry_is_due(pool: PgPool) {
+    let db = TestDb::new(pool.clone()).await;
+    let mut wakeups = listen(&pool, &ironqueue::__test_support::notify_channel(db.queue.name())).await;
+    let delayed = db
+        .queue
+        .enqueue_raw(with_config("delayed", |config| {
+            config.max_attempts = 2;
+            config.retry_delay = Duration::from_secs(3600);
+        }))
+        .await
+        .unwrap()
+        .unwrap();
+    let immediate =
+        db.queue.enqueue_raw(with_config("immediate", |config| config.max_attempts = 2)).await.unwrap().unwrap();
+    // Drain the two enqueue wakeups so only the retries are observed below.
+    expect_notification(&mut wakeups, "the first enqueue").await;
+    expect_notification(&mut wakeups, "the second enqueue").await;
+    let active = db.queue.dequeue(2, Uuid::now_v7()).await.unwrap();
+    let delayed_row = active.iter().find(|job| job.id == delayed).unwrap();
+    let immediate_row = active.iter().find(|job| job.id == immediate).unwrap();
+
+    assert!(db.queue.retry(delayed_row, "failed: later").await.unwrap());
+    expect_silence(&mut wakeups, "a retry scheduled for later").await;
+    assert!(db.queue.retry(immediate_row, "failed: now").await.unwrap());
+    expect_notification(&mut wakeups, "a due retry").await;
+}
+
+/// With a throttle, a handle asks for one notifying commit per window however
+/// many enqueues it makes; the rest are carried by the workers' poll interval.
+/// The throttle is per handle, a window that has elapsed opens a new slot, and
+/// zero disables it.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_notify_throttle_emits_one_wakeup_per_window(pool: PgPool) {
+    let db = TestDb::with(pool.clone(), |builder| builder.notify_throttle(Duration::from_secs(60))).await;
+    let mut wakeups = listen(&pool, &ironqueue::__test_support::notify_channel(db.queue.name())).await;
+
+    for n in 0..3 {
+        db.queue.enqueue_raw(new_job(&format!("throttled-{n}"), |_| {})).await.unwrap();
+    }
+    expect_notification(&mut wakeups, "the first enqueue in a window").await;
+    expect_silence(&mut wakeups, "an enqueue inside the window").await;
+    assert_eq!(db.queue.counts().await.unwrap().queued, 3, "throttling the wakeup never drops the job");
+
+    let unthrottled = db.another_queue(|builder| builder).await;
+    unthrottled.enqueue_raw(new_job("other-handle", |_| {})).await.unwrap();
+    expect_notification(&mut wakeups, "an unthrottled handle").await;
+
+    let short = db.another_queue(|builder| builder.notify_throttle(Duration::from_millis(500))).await;
+    short.enqueue_raw(new_job("short-1", |_| {})).await.unwrap();
+    expect_notification(&mut wakeups, "the first enqueue of a short window").await;
+    short.enqueue_raw(new_job("short-2", |_| {})).await.unwrap();
+    expect_silence(&mut wakeups, "the second enqueue of a short window").await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    short.enqueue_raw(new_job("short-3", |_| {})).await.unwrap();
+    expect_notification(&mut wakeups, "an enqueue after the window elapsed").await;
+
+    let disabled = db.another_queue(|builder| builder.notify_throttle(Duration::ZERO)).await;
+    disabled.enqueue_raw(new_job("disabled-1", |_| {})).await.unwrap();
+    disabled.enqueue_raw(new_job("disabled-2", |_| {})).await.unwrap();
+    expect_notification(&mut wakeups, "the first enqueue with the throttle disabled").await;
+    expect_notification(&mut wakeups, "the second enqueue with the throttle disabled").await;
+}
+
+/// A completion notification goes out only for a row somebody is waiting on.
+/// Every other finish would pay the cluster-wide notify lock for a message no
+/// listener has a use for. The rule holds on every path that finishes a row:
+/// the owner's finish, a queued abort, and the background recovery of a
+/// dropped attempt, which finishes through the batch macro.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_finishes_notify_only_awaited_jobs(pool: PgPool) {
+    let db = TestDb::new(pool.clone()).await;
+    let mut completions = listen(&pool, &ironqueue::__test_support::done_channel(db.queue.name())).await;
+    let payload_of = |notification: sqlx::postgres::PgNotification| -> serde_json::Value {
+        serde_json::from_str(notification.payload()).expect("completion payload is JSON")
+    };
+
+    let silent = db.queue.enqueue_raw(new_job("silent", |_| {})).await.unwrap().unwrap();
+    let awaited = db.queue.enqueue_raw(new_job("awaited", |_| {})).await.unwrap().unwrap();
+    mark_awaited(&db, awaited).await;
+    let active = db.queue.dequeue(2, Uuid::now_v7()).await.unwrap();
+    let silent_row = active.iter().find(|job| job.id == silent).unwrap();
+    let awaited_row = active.iter().find(|job| job.id == awaited).unwrap();
+    assert!(db.queue.finish(silent_row, JobStatus::Complete, None, None).await.unwrap());
+    expect_silence(&mut completions, "finishing a job nobody waits on").await;
+    assert!(db.queue.finish(awaited_row, JobStatus::Failed, None, Some("failed: boom")).await.unwrap());
+    let payload = payload_of(expect_notification(&mut completions, "finishing an awaited job").await);
+    assert_eq!(payload, json!({"id": awaited, "status": "failed"}));
+
+    let silent = db.queue.enqueue_raw(new_job("silent-queued", |_| {})).await.unwrap().unwrap();
+    assert!(db.queue.abort_job(silent, "not needed").await.unwrap());
+    expect_silence(&mut completions, "aborting a queued job nobody waits on").await;
+    let awaited = db.queue.enqueue_raw(new_job("awaited-queued", |_| {})).await.unwrap().unwrap();
+    mark_awaited(&db, awaited).await;
+    assert!(db.queue.abort_job(awaited, "not needed").await.unwrap());
+    let payload = payload_of(expect_notification(&mut completions, "aborting an awaited queued job").await);
+    assert_eq!(payload, json!({"id": awaited, "status": "aborted"}));
+
+    let consumer = leased_consumer(&db.queue, Uuid::now_v7()).await;
+    let silent =
+        db.queue.enqueue_raw(with_config("silent-dropped", |config| config.max_attempts = 1)).await.unwrap().unwrap();
+    drop(consumer.dequeue(1).await.unwrap());
+    wait_for_some(Duration::from_secs(10), Duration::from_millis(10), "dropped attempt was not aborted", || async {
+        db.queue.fetch_job(silent).await.unwrap().filter(|row| row.status.is_terminal())
+    })
+    .await;
+    expect_silence(&mut completions, "recovering a dropped attempt nobody waits on").await;
+    let awaited =
+        db.queue.enqueue_raw(with_config("awaited-dropped", |config| config.max_attempts = 1)).await.unwrap().unwrap();
+    mark_awaited(&db, awaited).await;
+    drop(consumer.dequeue(1).await.unwrap());
+    let payload = payload_of(expect_notification(&mut completions, "recovering an awaited dropped attempt").await);
+    assert_eq!(payload, json!({"id": awaited, "status": "aborted"}));
+}
+
+/// Failed and aborted rows expire on their own clock. A result is read within
+/// moments of the finish by whoever waited for it; a failure is read by an
+/// operator after the fact, so one shared retention purged failures before
+/// anyone looked. Each finish path applies the retention of its outcome.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_failed_and_aborted_rows_keep_the_failure_retention(pool: PgPool) {
+    let db = TestDb::new(pool.clone()).await;
+    let short_result_long_failure = |config: &mut JobConfig| {
+        config.retention = JobRetention::For(Duration::from_millis(1));
+        config.failed_retention = JobRetention::For(Duration::from_secs(3600));
+    };
+    let completes = db.queue.enqueue_raw(with_config("completes", short_result_long_failure)).await.unwrap().unwrap();
+    let fails = db.queue.enqueue_raw(with_config("fails", short_result_long_failure)).await.unwrap().unwrap();
+    let aborts = db.queue.enqueue_raw(with_config("aborts", short_result_long_failure)).await.unwrap().unwrap();
+    let aborts_queued =
+        db.queue.enqueue_raw(with_config("aborts-queued", short_result_long_failure)).await.unwrap().unwrap();
+    let active = db.queue.dequeue(3, Uuid::now_v7()).await.unwrap();
+    let row_of = |id: Uuid| active.iter().find(|job| job.id == id).unwrap();
+    let soon = Timestamp::now() + SignedDuration::from_secs(60);
+    let much_later = Timestamp::now() + SignedDuration::from_secs(1800);
+
+    assert!(db.queue.finish(row_of(completes), JobStatus::Complete, None, None).await.unwrap());
+    assert!(db.queue.fetch_job(completes).await.unwrap().unwrap().expires_at.unwrap() < soon, "result retention");
+    assert!(db.queue.finish(row_of(fails), JobStatus::Failed, None, Some("failed: boom")).await.unwrap());
+    let failed = db.queue.fetch_job(fails).await.unwrap().unwrap();
+    assert!(failed.expires_at.unwrap() > much_later, "failure retention");
+    assert_eq!(failed.failed_ttl_ms, Some(3_600_000));
+    assert_eq!(failed.failed_retention(), JobRetention::For(Duration::from_secs(3600)));
+    assert_eq!(failed.retention(), JobRetention::For(Duration::from_millis(1)));
+    assert!(db.queue.finish(row_of(aborts), JobStatus::Aborted, None, Some("stop")).await.unwrap());
+    assert!(db.queue.fetch_job(aborts).await.unwrap().unwrap().expires_at.unwrap() > much_later, "abort retention");
+    assert!(db.queue.abort_job(aborts_queued, "not needed").await.unwrap());
+    assert!(
+        db.queue.fetch_job(aborts_queued).await.unwrap().unwrap().expires_at.unwrap() > much_later,
+        "queued abort retention"
+    );
+
+    // Immediate deletion is per outcome too.
+    let forgets_failures = |config: &mut JobConfig| {
+        config.retention = JobRetention::Forever;
+        config.failed_retention = JobRetention::DeleteImmediately;
+    };
+    let gone = db.queue.enqueue_raw(with_config("gone", forgets_failures)).await.unwrap().unwrap();
+    let kept = db.queue.enqueue_raw(with_config("kept", forgets_failures)).await.unwrap().unwrap();
+    let active = db.queue.dequeue(2, Uuid::now_v7()).await.unwrap();
+    let row_of = |id: Uuid| active.iter().find(|job| job.id == id).unwrap();
+    assert!(db.queue.finish(row_of(gone), JobStatus::Failed, None, Some("failed: boom")).await.unwrap());
+    assert!(db.queue.fetch_job(gone).await.unwrap().is_none(), "a failure with immediate retention is deleted");
+    assert!(db.queue.finish(row_of(kept), JobStatus::Complete, None, None).await.unwrap());
+    assert!(db.queue.fetch_job(kept).await.unwrap().unwrap().expires_at.is_none(), "a result kept forever");
+
+    assert_eq!(JobConfig::default().failed_retention, JobRetention::For(Duration::from_secs(7 * 24 * 3600)));
+
+    // The column carries `result_ttl_ms`'s bounds.
+    let error = sqlx::query("UPDATE ironqueue.jobs SET failed_ttl_ms = -1 WHERE id = $1")
+        .bind(kept)
+        .execute(db.queue.pool())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("failed_ttl_ms"), "{error}");
+}
+
+/// Counts cannot tell a busy queue from a stalled one; when the oldest ready
+/// job became due can, and it moves as the head of the queue is claimed.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_counts_report_when_the_oldest_ready_job_became_due(pool: PgPool) {
+    let db = TestDb::new(pool.clone()).await;
+    assert_eq!(db.queue.counts().await.unwrap().oldest_ready_at, None);
+
+    db.queue
+        .enqueue_raw(new_job("later", |job| {
+            job.scheduled_at = Some(Timestamp::now() + SignedDuration::from_secs(3600))
+        }))
+        .await
+        .unwrap();
+    let counts = db.queue.counts().await.unwrap();
+    assert_eq!(counts.scheduled, 1);
+    assert_eq!(counts.oldest_ready_at, None, "a scheduled job is not ready");
+
+    let older = db
+        .queue
+        .enqueue_raw(new_job("older", |job| job.scheduled_at = Some(Timestamp::now() - SignedDuration::from_secs(40))))
+        .await
+        .unwrap()
+        .unwrap();
+    let old = db
+        .queue
+        .enqueue_raw(new_job("old", |job| job.scheduled_at = Some(Timestamp::now() - SignedDuration::from_secs(20))))
+        .await
+        .unwrap()
+        .unwrap();
+    let due_at = |id: Uuid| {
+        let queue = db.queue.clone();
+        async move { queue.fetch_job(id).await.unwrap().unwrap().scheduled_at }
+    };
+    let counts = db.queue.counts().await.unwrap();
+    assert_eq!(counts.queued, 2);
+    assert_eq!(counts.oldest_ready_at, Some(due_at(older).await));
+
+    let claimed = db.queue.dequeue(1, Uuid::now_v7()).await.unwrap();
+    assert_eq!(claimed[0].id, older);
+    assert_eq!(db.queue.counts().await.unwrap().oldest_ready_at, Some(due_at(old).await));
+    db.queue.dequeue(1, Uuid::now_v7()).await.unwrap();
+    assert_eq!(db.queue.counts().await.unwrap().oldest_ready_at, None);
+}
+
+/// An operator's purge deletes queued rows of this queue and nothing else:
+/// not running attempts, not another queue, not a row a claim is locking.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_purge_queued_jobs_deletes_only_queued_rows_of_this_queue(pool: PgPool) {
+    let db = TestDb::new(pool.clone()).await;
+    let other = db.another_queue(|builder| builder.name("other")).await;
+    let running = db.queue.enqueue_raw(new_job("a", |_| {})).await.unwrap().unwrap();
+    let queued_a = db.queue.enqueue_raw(new_job("a", |_| {})).await.unwrap().unwrap();
+    let scheduled_a = db
+        .queue
+        .enqueue_raw(new_job("a", |job| job.scheduled_at = Some(Timestamp::now() + SignedDuration::from_secs(3600))))
+        .await
+        .unwrap()
+        .unwrap();
+    for _ in 0..2 {
+        db.queue.enqueue_raw(new_job("b", |_| {})).await.unwrap();
+    }
+    let elsewhere = other.enqueue_raw(new_job("a", |_| {})).await.unwrap().unwrap();
+    assert_eq!(db.queue.dequeue(1, Uuid::now_v7()).await.unwrap()[0].id, running);
+
+    assert!(matches!(db.queue.purge_queued_jobs(None, 0).await.unwrap_err(), Error::Config(_)));
+    assert_eq!(db.queue.purge_queued_jobs(Some("a"), 1).await.unwrap(), 1, "bounded by the limit");
+    assert!(db.queue.fetch_job(queued_a).await.unwrap().is_none(), "the oldest due row goes first");
+    assert_eq!(db.queue.purge_queued_jobs(Some("a"), 10).await.unwrap(), 1, "a scheduled job is a queued job");
+    assert!(db.queue.fetch_job(scheduled_a).await.unwrap().is_none());
+    assert_eq!(
+        db.queue.fetch_job(running).await.unwrap().unwrap().status,
+        JobStatus::Running,
+        "attempts are untouched"
+    );
+    assert_eq!(db.queue.purge_queued_jobs(None, 10).await.unwrap(), 2, "no name purges every name");
+    assert_eq!(db.queue.purge_queued_jobs(None, 10).await.unwrap(), 0);
+    assert_eq!(
+        other.fetch_job(elsewhere).await.unwrap().unwrap().status,
+        JobStatus::Queued,
+        "other queues are untouched"
+    );
+
+    // A row a claim is locking at that instant is skipped, not waited for.
+    let locked = other.enqueue_raw(new_job("b", |_| {})).await.unwrap().unwrap();
+    let mut claim = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM ironqueue.jobs WHERE id = $1 FOR UPDATE")
+        .bind(locked)
+        .execute(&mut *claim)
+        .await
+        .unwrap();
+    let purged = tokio::time::timeout(Duration::from_secs(5), other.purge_queued_jobs(Some("b"), 10))
+        .await
+        .expect("purge must not wait on a locked row")
+        .unwrap();
+    assert_eq!(purged, 0);
+    claim.rollback().await.unwrap();
+    assert_eq!(other.purge_queued_jobs(Some("b"), 10).await.unwrap(), 1);
+}
+
+/// The built-in monitoring role reads every table of the schema and writes
+/// none of it, so a metrics exporter needs no grant per deployment.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_pg_monitor_can_read_every_table_and_write_none(pool: PgPool) {
+    let _db = TestDb::new(pool.clone()).await;
+    let usage = sqlx::query_scalar::<_, bool>("SELECT has_schema_privilege('pg_monitor', 'ironqueue', 'USAGE')")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(usage, "pg_monitor must have USAGE on the schema");
+    for table in [
+        "jobs",
+        "workers",
+        "cron_schedules",
+        "cron_occurrences",
+        "migrations",
+    ] {
+        let (select, insert) = sqlx::query_as::<_, (bool, bool)>(
+            "SELECT has_table_privilege('pg_monitor', $1, 'SELECT'), has_table_privilege('pg_monitor', $1, 'INSERT')",
+        )
+        .bind(format!("ironqueue.{table}"))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(select, "pg_monitor must be able to read ironqueue.{table}");
+        assert!(!insert, "pg_monitor must not be able to write ironqueue.{table}");
+    }
 }
